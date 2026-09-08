@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Synthetic Test Fixture - Mock ID Card (Non-PII)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #f1f5f9;
+      font-family: Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .banner {
+      background: #dc2626;
+      color: #fff;
+      font-weight: bold;
+      font-size: 14px;
+      padding: 8px 16px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .canvas-wrapper {
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.2);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #fff;
+    }
+    canvas {
+      display: block;
+    }
+    .actions-bar {
+      margin-top: 24px;
+      display: flex;
+      gap: 12px;
+    }
+    .submit-btn {
+      background: #2563eb;
+      color: #ffffff;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 10px 24px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+      transition: background 0.2s;
+    }
+    .submit-btn:hover {
+      background: #1d4ed8;
+    }
+  </style>
+</head>
+<body>
+  <div class="banner">
+    ⚠️ SYNTHETIC TEST FIXTURE — ALL DATA IS FAKE / PLACEHOLDER (NOT REAL PII)
+  </div>
+
+  <div class="canvas-wrapper">
+    <canvas id="id-card-canvas" width="680" height="470"></canvas>
+  </div>
+
+  <div class="actions-bar">
+    <button id="submit-btn" class="submit-btn" type="button">Submit Verification</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('id-card-canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Card background
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, 680, 470);
+
+    // Card header bar
+    const grad = ctx.createLinearGradient(0, 0, 680, 0);
+    grad.addColorStop(0, '#1e3a8a');
+    grad.addColorStop(1, '#2563eb');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 680, 70);
+
+    // Header text
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px Arial, sans-serif';
+    ctx.fillText('GOVERNMENT OF INDIA (MOCK CARD)', 24, 42);
+
+    ctx.font = '11px Arial, sans-serif';
+    ctx.fillStyle = '#93c5fd';
+    ctx.fillText('SYNTHETIC TEST FIXTURE — FOR PRIVACY AGENT OCR STRESS-TEST', 24, 60);
+
+    // Photo placeholder box
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillRect(24, 100, 110, 140);
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(24, 100, 110, 140);
+
+    // Silhouette icon on photo
+    ctx.fillStyle = '#94a3b8';
+    ctx.beginPath();
+    ctx.arc(79, 145, 26, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(79, 215, 42, Math.PI, 0);
+    ctx.fill();
+
+    // Fields area - clear spacing so each line is distinct for OCR
+    const startX = 160;
+    
+    // Field 1: Name
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('Name:', startX, 115);
+    ctx.font = 'bold 19px Arial, sans-serif';
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText('Rahul Sharma', startX + 70, 115);
+
+    // Field 2: Aadhaar (12 digits)
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('Aadhaar:', startX, 168);
+    ctx.font = 'bold 19px Arial, sans-serif';
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText('2345 6789 0123', startX + 75, 168);
+
+    // Field 3: PAN (ABCDE1234F)
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('PAN:', startX, 220);
+    ctx.font = 'bold 19px Arial, sans-serif';
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText('ABCDE1234F', startX + 70, 220);
+
+    // Field 4: Address
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('Address:', startX, 272);
+    ctx.font = 'bold 18px Arial, sans-serif';
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText('MG Road, Bangalore', startX + 75, 272);
+
+    // Divider line
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(startX, 302);
+    ctx.lineTo(650, 302);
+    ctx.stroke();
+
+    // Field 5: Total Amount (Non-sensitive control field)
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('Total:', startX, 332);
+    ctx.font = 'bold 19px Arial, sans-serif';
+    ctx.fillStyle = '#15803d';
+    ctx.fillText('₹4,500', startX + 70, 332);
+
+    // Field 6: Unclassified Test Field (Not in any regex/label list — tests fail-safe to MASK)
+    ctx.font = 'bold 15px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('TokenCode:', startX, 382);
+    ctx.font = 'bold 18px Arial, sans-serif';
+    ctx.fillStyle = '#334155';
+    ctx.fillText('TOK-99881-XZ', startX + 90, 382);
+
+    // Footer badge
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(0, 425, 680, 45);
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.strokeRect(0, 425, 680, 45);
+    ctx.font = 'italic 12px Arial, sans-serif';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('MOCK IDENTIFICATION CARD • FOR EVALUATION ONLY • NOT A VALID DOCUMENT', 80, 452);
+
+    // Interactive button listener for executor verification
+    const submitBtn = document.getElementById('submit-btn');
+    submitBtn.addEventListener('click', () => {
+      console.log('[MockIDCard] Submit button clicked!');
+      submitBtn.innerText = 'Verification Submitted! ✅';
+      submitBtn.style.background = '#16a34a';
+      submitBtn.dataset.clicked = 'true';
+      document.body.dataset.submitted = 'true';
+
+      const statusEl = document.getElementById('submission-status') || document.createElement('div');
+      statusEl.id = 'submission-status';
+      statusEl.style.marginTop = '12px';
+      statusEl.style.padding = '8px 16px';
+      statusEl.style.borderRadius = '6px';
+      statusEl.style.background = '#dcfce7';
+      statusEl.style.border = '1px solid #86efac';
+      statusEl.style.color = '#15803d';
+      statusEl.style.fontWeight = 'bold';
+      statusEl.style.fontSize = '14px';
+      statusEl.innerText = '✅ Success: Form verified and submitted by Nexus Privacy Agent!';
+      document.querySelector('.actions-bar').after(statusEl);
+    });
+  </script>
+</body>
+</html>
