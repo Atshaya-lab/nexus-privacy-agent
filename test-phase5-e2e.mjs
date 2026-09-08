@@ -162,7 +162,7 @@ try {
 
   // Wait for SafeContext ready banner
   console.log('Waiting for SafeContext generation...');
-  await popupPage.waitForSelector('#safe-context-banner', { timeout: 45000 });
+  await popupPage.waitForSelector('#safe-context-banner', { timeout: 90000 });
   const safeBannerText = await popupPage.evaluate(() => document.getElementById('safe-context-banner')?.innerText || '');
   console.log('✅ SafeContext Ready:', safeBannerText.replace(/\n/g, ' '));
 

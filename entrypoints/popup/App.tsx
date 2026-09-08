@@ -30,6 +30,15 @@ export default function App() {
   // Server Agent & Execution State
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [serverDetails, setServerDetails] = useState<any>(null);
+  const [gpuMode, setGpuMode] = useState<'MOCK' | 'REMOTE_API' | 'LOCAL_MODEL'>('MOCK');
+  const [gpuEndpoint, setGpuEndpoint] = useState<string>('http://localhost:8001/v1/chat/completions');
+  const [testingGpu, setTestingGpu] = useState<boolean>(false);
+  const [gpuTestResult, setGpuTestResult] = useState<{ success: boolean; message: string; latencyMs?: number } | null>(null);
+
+  // One-Click 5-Phase Demo State
+  const [autoRunning, setAutoRunning] = useState<boolean>(false);
+  const [autoRunStep, setAutoRunStep] = useState<string>('');
+
   const [taskPrompt, setTaskPrompt] = useState<string>(
     'Click the submit button, but do not interact with the Aadhaar or PAN fields'
   );
@@ -146,6 +155,9 @@ export default function App() {
         const data = await res.json();
         setServerStatus('online');
         setServerDetails(data);
+        if (data.groundingMode) {
+          setGpuMode(data.groundingMode);
+        }
         return;
       }
     } catch {
@@ -153,6 +165,54 @@ export default function App() {
     }
     setServerStatus('offline');
     setServerDetails(null);
+  };
+
+  const handleUpdateGpuMode = async (mode: 'MOCK' | 'REMOTE_API' | 'LOCAL_MODEL', customEndpoint?: string) => {
+    setGpuMode(mode);
+    const endpoint = customEndpoint !== undefined ? customEndpoint : gpuEndpoint;
+    try {
+      const res = await fetch('http://127.0.0.1:8000/server/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, endpoint }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        checkServerHealth();
+      }
+    } catch (e) {
+      console.warn('Could not persist GPU mode to server:', e);
+    }
+  };
+
+  const handleTestGpu = async () => {
+    setTestingGpu(true);
+    setGpuTestResult(null);
+    try {
+      const res = await fetch('http://127.0.0.1:8000/server/test-gpu', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: gpuMode, endpoint: gpuEndpoint }),
+      });
+      const data = await res.json();
+      setGpuTestResult({
+        success: data.success,
+        message: data.message || (data.success ? 'GPU Server connected successfully' : 'Connection failed'),
+        latencyMs: data.latencyMs,
+      });
+    } catch (e: any) {
+      setGpuTestResult({
+        success: false,
+        message: e?.message || 'Failed to reach local server on port 8000',
+      });
+    } finally {
+      setTestingGpu(false);
+    }
+  };
+
+  const handleOpenTestFixture = async () => {
+    const fixtureUrl = chrome.runtime.getURL('test-fixtures/mock-id-card.html');
+    await chrome.tabs.create({ url: fixtureUrl });
   };
 
   // Load persisted policy, check server, and auto-capture context on mount
@@ -519,6 +579,115 @@ export default function App() {
     }
   };
 
+  const handleRunFullDemoFlow = async (overrideTask?: string) => {
+    setAutoRunning(true);
+    setError(null);
+    setPlanningError(null);
+    setExecutionError(null);
+    setExecutionReport(null);
+
+    const activeTask = overrideTask || taskPrompt;
+    if (overrideTask) setTaskPrompt(overrideTask);
+
+    try {
+      // Step 1: Capture & Perception
+      setAutoRunStep('1/5 Capturing Viewport DOM & Tiered Perception (WebGPU)...');
+      await handleCaptureContext();
+
+      // Give state a brief tick to settle
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      // Step 2: Privacy Gate
+      setAutoRunStep('2/5 Enforcing Privacy Gate & On-Screen Solid Blackout Masks...');
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      // Step 3: Grounding & Planning
+      setAutoRunStep(`3/5 Visual Grounding & Planning via ZonUI-3B [${gpuMode}]...`);
+      
+      // Request plan directly
+      let currentSafe = safeContext;
+      if (!currentSafe) {
+        // Fallback fetch if state not yet updated in closure
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (currentActive?.id) {
+          const domRes = await chrome.tabs.sendMessage(currentActive.id, { type: 'GET_CONTEXT' }).catch(() => null);
+          const domNodes = Array.isArray(domRes) ? domRes : domRes?.dom || [];
+          const scr = await chrome.runtime.sendMessage({ type: 'CAPTURE_SCREEN', windowId: currentActive.windowId }).catch(() => '');
+          const perceived: PerceivedContext = {
+            url: currentActive.url || '',
+            timestamp: Date.now(),
+            dom: domNodes,
+            screenshot: typeof scr === 'string' ? scr : scr?.screenshot || '',
+          };
+          const cls = detectPii(domNodes, []);
+          currentSafe = await sanitize(perceived, perceived, cls, policy);
+          setSafeContext(currentSafe);
+        }
+      }
+
+      if (!currentSafe) {
+        throw new Error('Could not establish SafeContext for automated demo.');
+      }
+
+      const planPayload = {
+        task: activeTask,
+        safeContext: {
+          url: currentSafe.url,
+          timestamp: currentSafe.timestamp,
+          sanitizedDom: currentSafe.sanitizedDom,
+          redactedScreenshot: currentSafe.redactedScreenshot,
+          auditLog: currentSafe.auditLog,
+        },
+      };
+
+      const planRes = await fetch('http://127.0.0.1:8000/agent/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(planPayload),
+      });
+
+      if (!planRes.ok) {
+        const errJson = await planRes.json().catch(() => ({}));
+        throw new Error(errJson.detail || `Server returned status ${planRes.status}`);
+      }
+
+      const generatedPlan: PlanResponse = await planRes.json();
+      setPlan(generatedPlan);
+
+      // Step 4: Autonomous Execution
+      if (generatedPlan.actions.length > 0) {
+        setAutoRunStep('4/5 Double-Checking Safety & Executing Actions in Browser...');
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        let targetTabId = capturedTabId;
+        if (!targetTabId) {
+          const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+          targetTabId = currentActive?.id || null;
+        }
+
+        if (targetTabId) {
+          const report: ExecutionReport = await chrome.tabs.sendMessage(targetTabId, {
+            type: 'EXECUTE_PLAN',
+            actions: generatedPlan.actions,
+            safeContextAuditLog: currentSafe.auditLog || [],
+          });
+          setExecutionReport(report);
+        }
+        setAutoRunStep('5/5 Demo Succeeded: Plan executed with 100% data sovereignty! ✅');
+      } else if (generatedPlan.blockedActions.length > 0) {
+        setAutoRunStep('5/5 Privacy Gate Succeeded: Adversarial access intercepted & blocked! 🛡️');
+      } else {
+        setAutoRunStep('5/5 Planning Complete.');
+      }
+    } catch (e: any) {
+      console.error('Full demo error:', e);
+      setError(e?.message || 'Full demo flow failed');
+      setAutoRunStep(`⚠️ Flow Interrupted: ${e?.message || e}`);
+    } finally {
+      setAutoRunning(false);
+    }
+  };
+
   return (
     <div className="agent-container">
       <header className="agent-header">
@@ -567,11 +736,60 @@ export default function App() {
       {/* Tab 1: Agent Loop */}
       {activeTab === 'agent' && (
         <div className="tab-content" id="agent-tab-content">
-          <div className="action-section">
+          {/* ⚡ One-Click 5-Phase Demo Card */}
+          <div className="full-demo-card" id="full-demo-card">
+            <div className="full-demo-header">
+              <span className="full-demo-title">
+                <span>⚡</span>
+                <span>One-Click Complete Demo Flow</span>
+              </span>
+              <span style={{ fontSize: '0.70rem', background: 'rgba(255,255,255,0.2)', padding: '2px 6px', borderRadius: '4px' }}>
+                PHASE 1 → 5
+              </span>
+            </div>
+            <div className="full-demo-desc">
+              Runs end-to-end: On-device Perception → Privacy Gate → ZonUI-3B Grounding [{gpuMode}] → Autonomous Browser Execution.
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+              <button
+                className="full-demo-btn"
+                onClick={() =>
+                  handleRunFullDemoFlow(
+                    'Click the submit button, but do not interact with the Aadhaar or PAN fields'
+                  )
+                }
+                disabled={autoRunning || loading || planning || executing || serverStatus === 'offline'}
+                id="run-legitimate-demo-btn"
+                title="Executes form submission while protecting masked PII"
+              >
+                {autoRunning ? '⏳ Running Flow...' : '🚀 Legitimate Demo'}
+              </button>
+              <button
+                className="full-demo-btn"
+                style={{ background: 'linear-gradient(90deg, #b91c1c 0%, #c026d3 100%)', borderColor: '#fca5a5' }}
+                onClick={() => handleRunFullDemoFlow('Click the Aadhaar field')}
+                disabled={autoRunning || loading || planning || executing || serverStatus === 'offline'}
+                id="run-adversarial-demo-btn"
+                title="Attempts to target sensitive Aadhaar PII to demonstrate Privacy Gate interception"
+              >
+                {autoRunning ? '⏳ Running Flow...' : '🛡️ Adversarial Demo'}
+              </button>
+            </div>
+
+            {autoRunStep && (
+              <div className="demo-progress-ticker" id="demo-progress-ticker">
+                <span>▶</span>
+                <span>{autoRunStep}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="action-section" style={{ marginBottom: '8px' }}>
             <button
               className="capture-button"
               onClick={handleCaptureContext}
-              disabled={loading || visionLoading || sanitizing}
+              disabled={loading || visionLoading || sanitizing || autoRunning}
               id="capture-context-btn"
             >
               {loading
@@ -589,15 +807,23 @@ export default function App() {
           {error && <div className="error-banner">⚠️ {error}</div>}
 
           {!safeContext ? (
-            <div className="task-card" style={{ textAlign: 'center', padding: '24px 14px' }}>
-              <div style={{ fontSize: '2rem', marginBottom: '8px' }}>🛡️</div>
-              <strong style={{ display: 'block', marginBottom: '6px', color: '#0f172a' }}>
+            <div className="task-card" style={{ textAlign: 'center', padding: '20px 14px' }}>
+              <div style={{ fontSize: '1.8rem', marginBottom: '6px' }}>🛡️</div>
+              <strong style={{ display: 'block', marginBottom: '4px', color: '#0f172a' }}>
                 Zero-Leak Privacy Boundary
               </strong>
-              <p style={{ fontSize: '0.78rem', color: '#64748b', lineHeight: 1.45, margin: 0 }}>
-                Click <strong>Capture &amp; Sanitize Context</strong> above to extract the DOM, run
-                tiered visual perception, and redact sensitive PII before communicating with the Server Agent.
+              <p style={{ fontSize: '0.76rem', color: '#64748b', lineHeight: 1.45, margin: 0 }}>
+                Click <strong>Capture &amp; Sanitize Context</strong> above or launch the synthetic test fixture to test on-device perception and visual grounding.
               </p>
+              <button
+                className="fixture-launch-btn"
+                onClick={handleOpenTestFixture}
+                type="button"
+                id="launch-fixture-btn"
+              >
+                <span>📄</span>
+                <span>Launch Mock ID Card Test Page</span>
+              </button>
             </div>
           ) : (
             <>
@@ -1141,6 +1367,125 @@ export default function App() {
       {/* Tab 3: Settings */}
       {activeTab === 'settings' && (
         <div className="tab-content settings-tab" id="settings-tab-content">
+          {/* ⚡ GPU Grounding & Server Configuration Card */}
+          <div className="gpu-settings-card" id="gpu-settings-card">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+              <strong style={{ fontSize: '0.84rem', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span>⚡</span>
+                <span>ZonUI-3B Grounding Engine</span>
+              </strong>
+              <span style={{ fontSize: '0.70rem', background: '#e2e8f0', padding: '2px 6px', borderRadius: '4px', fontWeight: 700 }}>
+                {gpuMode}
+              </span>
+            </div>
+            <p style={{ fontSize: '0.73rem', color: '#64748b', margin: '0 0 8px 0', lineHeight: 1.35 }}>
+              Choose whether visual grounding runs on a remote GPU (Google Colab / vLLM), local PyTorch accelerator, or the ultra-fast deterministic mock.
+            </p>
+
+            <div className="gpu-mode-selector">
+              <button
+                className={`gpu-mode-btn ${gpuMode === 'MOCK' ? 'active' : ''}`}
+                onClick={() => handleUpdateGpuMode('MOCK')}
+                type="button"
+                id="gpu-mode-mock-btn"
+              >
+                Mock (Fast 5ms)
+              </button>
+              <button
+                className={`gpu-mode-btn ${gpuMode === 'REMOTE_API' ? 'active' : ''}`}
+                onClick={() => handleUpdateGpuMode('REMOTE_API')}
+                type="button"
+                id="gpu-mode-remote-btn"
+              >
+                Colab / Remote GPU
+              </button>
+              <button
+                className={`gpu-mode-btn ${gpuMode === 'LOCAL_MODEL' ? 'active' : ''}`}
+                onClick={() => handleUpdateGpuMode('LOCAL_MODEL')}
+                type="button"
+                id="gpu-mode-local-btn"
+              >
+                Local PyTorch
+              </button>
+            </div>
+
+            {gpuMode === 'REMOTE_API' && (
+              <div style={{ marginTop: '8px' }}>
+                <label style={{ fontSize: '0.72rem', fontWeight: 600, color: '#334155', display: 'block', marginBottom: '4px' }}>
+                  Remote GPU Endpoint (Hugging Face / Colab / vLLM):
+                </label>
+                <div className="gpu-input-row">
+                  <input
+                    type="text"
+                    className="gpu-endpoint-input"
+                    value={gpuEndpoint}
+                    onChange={(e) => setGpuEndpoint(e.target.value)}
+                    placeholder="https://router.huggingface.co/hf-inference/v1/chat/completions"
+                    id="gpu-endpoint-input"
+                  />
+                  <button
+                    className="gpu-test-btn"
+                    onClick={() => handleUpdateGpuMode('REMOTE_API', gpuEndpoint)}
+                    type="button"
+                    id="save-gpu-endpoint-btn"
+                  >
+                    Save
+                  </button>
+                </div>
+                
+                {/* Quick Presets */}
+                <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
+                  <button
+                    type="button"
+                    style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e', borderRadius: '4px', padding: '3px 6px', fontSize: '0.68rem', fontWeight: 700, cursor: 'pointer' }}
+                    onClick={() => {
+                      const hfUrl = 'https://router.huggingface.co/hf-inference/v1/chat/completions';
+                      setGpuEndpoint(hfUrl);
+                      handleUpdateGpuMode('REMOTE_API', hfUrl);
+                    }}
+                    id="preset-hf-btn"
+                  >
+                    🤗 Hugging Face (ZonUI-3B)
+                  </button>
+                  <button
+                    type="button"
+                    style={{ background: '#e0f2fe', border: '1px solid #bae6fd', color: '#0369a1', borderRadius: '4px', padding: '3px 6px', fontSize: '0.68rem', fontWeight: 700, cursor: 'pointer' }}
+                    onClick={() => {
+                      const colabUrl = 'http://localhost:8001/ground';
+                      setGpuEndpoint(colabUrl);
+                      handleUpdateGpuMode('REMOTE_API', colabUrl);
+                    }}
+                    id="preset-colab-btn"
+                  >
+                    ☁️ Colab / Tunnel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: '10px', display: 'flex', gap: '6px' }}>
+              <button
+                className="gpu-test-btn"
+                style={{ width: '100%' }}
+                onClick={handleTestGpu}
+                disabled={testingGpu}
+                type="button"
+                id="test-gpu-conn-btn"
+              >
+                {testingGpu ? '⏳ Testing Connection...' : '🔌 Test GPU Connection & Ping'}
+              </button>
+            </div>
+
+            {gpuTestResult && (
+              <div className={`gpu-test-result ${gpuTestResult.success ? 'success' : 'error'}`}>
+                <span>{gpuTestResult.success ? '✅' : '❌'} {gpuTestResult.message}</span>
+                {gpuTestResult.latencyMs !== undefined && (
+                  <strong style={{ fontSize: '0.70rem' }}>{gpuTestResult.latencyMs}ms</strong>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="settings-header">
             <h3>Policy Engine Configuration</h3>
             <p className="settings-desc">

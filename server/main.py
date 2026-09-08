@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from server.ground import groundElement, ZONUI_MODE, ZONUI_ENDPOINT
+from server.ground import groundElement, ZONUI_MODE, ZONUI_ENDPOINT, set_zonui_config, get_zonui_config
 from server.planner import planSteps
 from server.verify import crossVerify
 
@@ -39,6 +39,13 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # Request / Response Schemas
 # ------------------------------------------------------------------------------
+class ServerConfigRequest(BaseModel):
+    mode: Optional[str] = None
+    endpoint: Optional[str] = None
+    apiKey: Optional[str] = None
+    modelId: Optional[str] = None
+
+
 class ActionItem(BaseModel):
     action: Literal["click", "type", "scroll", "select"] = "click"
     targetSelector: str
@@ -74,15 +81,108 @@ class PlanResponse(BaseModel):
 # ------------------------------------------------------------------------------
 @app.get("/health")
 def health_check():
-    mode = os.environ.get("ZONUI_MODE", ZONUI_MODE).upper()
+    cfg = get_zonui_config()
     return {
         "status": "healthy",
         "service": "Nexus Server Agent",
-        "groundingModel": "ZonUI-3B",
-        "groundingMode": mode,
-        "endpoint": ZONUI_ENDPOINT if mode == "REMOTE_API" else "local",
+        "groundingModel": cfg["modelId"],
+        "groundingMode": cfg["mode"],
+        "endpoint": cfg["endpoint"] if cfg["mode"] == "REMOTE_API" else "local",
         "privacyBoundary": "SafeContext-enforced",
     }
+
+
+@app.get("/server/config")
+def get_config_endpoint():
+    return get_zonui_config()
+
+
+@app.post("/server/config")
+def update_config_endpoint(req: ServerConfigRequest):
+    updated = set_zonui_config(
+        mode=req.mode,
+        endpoint=req.endpoint,
+        api_key=req.apiKey,
+        model_id=req.modelId
+    )
+    logger.info(f"Updated server ZonUI configuration: {updated}")
+    return updated
+
+
+@app.post("/server/test-gpu")
+def test_gpu_endpoint(req: Optional[ServerConfigRequest] = None):
+    """Tests connectivity to the configured GPU endpoint or local model."""
+    import urllib.request
+    target_endpoint = (req.endpoint if req and req.endpoint else None) or get_zonui_config()["endpoint"]
+    target_mode = (req.mode.upper() if req and req.mode else None) or get_zonui_config()["mode"]
+
+    if target_mode == "MOCK":
+        return {
+            "success": True,
+            "mode": "MOCK",
+            "message": "Mock Grounding active (~5ms deterministic latency)",
+            "latencyMs": 5.0
+        }
+    
+    if target_mode == "LOCAL_MODEL":
+        try:
+            import torch
+            cuda_avail = torch.cuda.is_available()
+            device_name = torch.cuda.get_device_name(0) if cuda_avail else "CPU (Fallback)"
+            return {
+                "success": True,
+                "mode": "LOCAL_MODEL",
+                "message": f"Local PyTorch accelerator ready on {device_name}",
+                "cudaAvailable": cuda_avail,
+                "deviceName": device_name
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "mode": "LOCAL_MODEL",
+                "message": f"Local PyTorch error: {e}"
+            }
+
+    # REMOTE_API testing
+    start = time.time()
+    try:
+        # Try a lightweight health ping or sample ground check
+        parsed_url = target_endpoint
+        health_url = parsed_url.replace("/ground", "/health").replace("/v1/chat/completions", "/health")
+        try:
+            req_ping = urllib.request.Request(health_url, headers={"User-Agent": "Nexus-Privacy-Agent"})
+            with urllib.request.urlopen(req_ping, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                latency = round((time.time() - start) * 1000, 1)
+                return {
+                    "success": True,
+                    "mode": "REMOTE_API",
+                    "endpoint": target_endpoint,
+                    "message": f"GPU Server reached successfully ({latency}ms)",
+                    "latencyMs": latency,
+                    "details": data
+                }
+        except Exception:
+            # Fallback direct ping
+            req_ping = urllib.request.Request(target_endpoint, headers={"User-Agent": "Nexus-Privacy-Agent"})
+            with urllib.request.urlopen(req_ping, timeout=6) as resp:
+                latency = round((time.time() - start) * 1000, 1)
+                return {
+                    "success": True,
+                    "mode": "REMOTE_API",
+                    "endpoint": target_endpoint,
+                    "message": f"GPU Endpoint responded ({latency}ms)",
+                    "latencyMs": latency
+                }
+    except Exception as e:
+        latency = round((time.time() - start) * 1000, 1)
+        return {
+            "success": False,
+            "mode": "REMOTE_API",
+            "endpoint": target_endpoint,
+            "message": f"Could not connect to GPU endpoint: {e}",
+            "latencyMs": latency
+        }
 
 
 @app.post("/agent/plan", response_model=PlanResponse)
