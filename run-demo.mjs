@@ -26,6 +26,11 @@ console.log('Starting Nexus FastAPI Server Agent on http://127.0.0.1:8000...');
 const serverProc = spawn('python', ['-m', 'uvicorn', 'server.main:app', '--host', '127.0.0.1', '--port', '8000', '--reload'], {
   cwd: __dirname,
   stdio: 'inherit',
+  env: {
+    ...process.env,
+    ZONUI_MODE: process.env.ZONUI_MODE || 'remote_api',
+    ZONUI_ENDPOINT: process.env.ZONUI_ENDPOINT || 'https://then-participating-hints-solaris.trycloudflare.com/ground',
+  },
 });
 
 // 3. Launch browser with extension loaded

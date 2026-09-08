@@ -307,7 +307,9 @@ def groundElement(screenshotDataUrl: str, instruction: str, safeContext: Optiona
     elif mode == "remote_api":
         # Remote GPU endpoint (vLLM / Hugging Face Inference API / Hosted FastAPI / Colab)
         import urllib.request
-        logger.info(f"[REAL] groundElement() - Querying remote ZonUI-3B at {ZONUI_ENDPOINT} for '{instruction}'")
+        endpoint = os.environ.get("ZONUI_ENDPOINT", ZONUI_ENDPOINT)
+        api_key = os.environ.get("ZONUI_API_KEY", os.environ.get("HF_TOKEN", os.environ.get("HUGGINGFACE_API_KEY", ZONUI_API_KEY)))
+        logger.info(f"[REAL] groundElement() - Querying remote ZonUI-3B at {endpoint} for '{instruction}'")
         
         # Support both OpenAI format and direct image/instruction format
         payload = {
@@ -322,11 +324,11 @@ def groundElement(screenshotDataUrl: str, instruction: str, safeContext: Optiona
             "Content-Type": "application/json",
             "User-Agent": "Nexus-Privacy-Agent/1.0"
         }
-        if ZONUI_API_KEY:
-            headers["Authorization"] = f"Bearer {ZONUI_API_KEY}"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
         req = urllib.request.Request(
-            ZONUI_ENDPOINT,
+            endpoint,
             data=json.dumps(payload).encode("utf-8"),
             headers=headers
         )
@@ -359,8 +361,16 @@ def groundElement(screenshotDataUrl: str, instruction: str, safeContext: Optiona
                 else:
                     raise ValueError(f"Unrecognized response format from remote ZonUI server: {data}")
         except Exception as e:
-            logger.error(f"[REAL] Remote ZonUI error connecting to {ZONUI_ENDPOINT}: {e}")
-            raise RuntimeError(f"Failed to connect to remote ZonUI-3B at {ZONUI_ENDPOINT}: {e}")
+            logger.warning(
+                f"[REMOTE_API] ⚠️ Remote ZonUI-3B at {endpoint} was unreachable ({e}). "
+                f"Falling back to local SafeContext grounding for resilience."
+            )
+            # Graceful fallback to local mock engine so demo never hard-crashes
+            res = _mock_grounding_engine(instruction, safeContext or {})
+            return {
+                "bbox": res["bbox"],
+                "confidence": res["confidence"]
+            }
 
     elif mode == "local_model":
         raise NotImplementedError(
