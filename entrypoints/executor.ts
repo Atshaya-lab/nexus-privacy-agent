@@ -187,15 +187,20 @@ export async function executeAction(
     }
   }
 
-  // 2. Defense-in-depth safety check on effective bounds
-  const privacyCheck = checkSpatialPrivacyViolation(effectiveBbox, auditLog);
+  // 2. Defense-in-depth safety check on BOTH effective bounds AND model-grounded coordinates
+  // Even if the server hallucinated, was compromised, or returned coordinates near sensitive elements,
+  // the client-side executor independently intercepts before any mouse event or keystroke can fire.
+  const privacyCheckEffective = checkSpatialPrivacyViolation(effectiveBbox, auditLog);
+  const privacyCheckGrounded = checkSpatialPrivacyViolation(action.groundedBbox, auditLog);
+  const privacyCheck = privacyCheckEffective.violated ? privacyCheckEffective : privacyCheckGrounded;
+
   if (privacyCheck.violated) {
-    console.error(`[Nexus Privacy Agent] 🚨 SECURITY VIOLATION:`, privacyCheck.reason);
+    console.error(`[Nexus Privacy Agent] 🚨 SECURITY VIOLATION (Client-Side Defense-in-Depth):`, privacyCheck.reason);
     return {
       stepIndex,
       action,
       status: 'BLOCKED',
-      message: privacyCheck.reason || 'Blocked by privacy gate',
+      message: privacyCheck.reason || 'Blocked by client-side privacy gate',
       timestamp,
     };
   }

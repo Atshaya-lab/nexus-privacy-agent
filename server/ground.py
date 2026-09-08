@@ -33,7 +33,7 @@ logger = logging.getLogger("NexusServerAgent.Ground")
 ZONUI_MODE = os.environ.get("ZONUI_MODE", "mock").lower()  # 'mock' | 'remote_api' | 'local_model'
 ZONUI_MODEL_ID = os.environ.get("ZONUI_MODEL_ID", "zonghanHZH/ZonUI-3B")
 ZONUI_ENDPOINT = os.environ.get("ZONUI_ENDPOINT", os.environ.get("ZONUI_API_URL", "http://localhost:8001/v1/chat/completions"))
-ZONUI_API_KEY = os.environ.get("ZONUI_API_KEY", "")
+ZONUI_API_KEY = os.environ.get("ZONUI_API_KEY", os.environ.get("HF_TOKEN", os.environ.get("HUGGINGFACE_API_KEY", "")))
 
 # Standard ZonUI-3B prompt template from the paper & model card
 ZONUI_SYSTEM_PROMPT = (
