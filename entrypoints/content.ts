@@ -85,9 +85,31 @@ export function extractDom(): DomNode[] {
   return nodes;
 }
 
+export function injectPrivacyStyles() {
+  if (!document.getElementById('nexus-privacy-injected-styles')) {
+    const style = document.createElement('style');
+    style.id = 'nexus-privacy-injected-styles';
+    style.textContent = `
+      .nexus-privacy-shielded {
+        filter: blur(7px) !important;
+        background-color: #090d16 !important;
+        color: transparent !important;
+        caret-color: transparent !important;
+        text-shadow: 0 0 8px rgba(255, 255, 255, 0.3) !important;
+        border: 2px solid #ef4444 !important;
+        border-radius: 4px !important;
+        transition: filter 0.2s ease !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+}
+
 export function renderPagePrivacyMasks(
-  masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string }>
+  masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string; elementSelector?: string }>
 ) {
+  injectPrivacyStyles();
+
   let container = document.getElementById('nexus-page-privacy-container');
   if (container) {
     container.remove();
@@ -102,29 +124,26 @@ export function renderPagePrivacyMasks(
 
   container = document.createElement('div');
   container.id = 'nexus-page-privacy-container';
-  container.style.position = 'absolute';
+  container.style.position = 'fixed';
   container.style.top = '0';
   container.style.left = '0';
-  container.style.width = '100%';
-  container.style.height = `${Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)}px`;
+  container.style.width = '100vw';
+  container.style.height = '100vh';
   container.style.pointerEvents = 'none';
   container.style.zIndex = '2147483640';
   container.style.fontFamily = 'system-ui, -apple-system, sans-serif';
 
-  const scrollX = window.scrollX || window.pageXOffset || 0;
-  const scrollY = window.scrollY || window.pageYOffset || 0;
-
   for (const item of masks) {
     const box = document.createElement('div');
-    box.style.position = 'absolute';
-    box.style.left = `${Math.max(0, item.bbox.x + scrollX)}px`;
-    box.style.top = `${Math.max(0, item.bbox.y + scrollY)}px`;
+    box.style.position = 'fixed';
+    box.style.left = `${Math.max(0, item.bbox.x)}px`;
+    box.style.top = `${Math.max(0, item.bbox.y)}px`;
     box.style.width = `${Math.max(20, item.bbox.width)}px`;
     box.style.height = `${Math.max(16, item.bbox.height)}px`;
     box.style.backgroundColor = '#05070e';
     box.style.border = item.action === 'BLOCK' ? '2px solid #991b1b' : '2px solid #ef4444';
     box.style.borderRadius = '4px';
-    box.style.boxShadow = '0 2px 8px rgba(239, 68, 68, 0.4)';
+    box.style.boxShadow = '0 2px 10px rgba(239, 68, 68, 0.5)';
     box.style.boxSizing = 'border-box';
     box.style.display = 'flex';
     box.style.alignItems = 'center';
@@ -144,7 +163,7 @@ export function renderPagePrivacyMasks(
     container.appendChild(box);
   }
 
-  document.body.appendChild(container);
+  (document.body || document.documentElement).appendChild(container);
 
   // Render floating status badge in bottom-right corner
   badge = document.createElement('div');
@@ -168,7 +187,7 @@ export function renderPagePrivacyMasks(
   badge.style.pointerEvents = 'auto';
   badge.style.cursor = 'default';
   badge.innerHTML = `<span>🛡️</span> <span>Privacy Guard Active: <strong>${masks.length} Field(s) Masked</strong></span>`;
-  document.body.appendChild(badge);
+  (document.body || document.documentElement).appendChild(badge);
 }
 
 export function clearPagePrivacyMasks() {
@@ -273,6 +292,16 @@ export default defineContentScript({
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 300);
     });
+
+    window.addEventListener('scroll', () => {
+      clearTimeout(mutationTimer);
+      mutationTimer = setTimeout(autoScanAndMask, 80);
+    }, { passive: true });
+
+    window.addEventListener('resize', () => {
+      clearTimeout(mutationTimer);
+      mutationTimer = setTimeout(autoScanAndMask, 100);
+    }, { passive: true });
 
     // 3. Message handlers for extension popup and background worker
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

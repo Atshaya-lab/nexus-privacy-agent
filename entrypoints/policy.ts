@@ -13,11 +13,15 @@ import type { PolicyAction, PolicyRecord } from '@/types';
 export const DEFAULT_POLICY: PolicyRecord = {
   aadhaar: 'MASK',
   pan: 'MASK',
-  name: 'ASK',
+  name: 'MASK',
   address: 'MASK',
   amount: 'ALLOW',
   phone: 'MASK',
   email: 'MASK',
+  ssn: 'MASK',
+  credit_card: 'MASK',
+  password: 'MASK',
+  dob: 'MASK',
 };
 
 const STORAGE_KEY = 'nexus_privacy_policy';
