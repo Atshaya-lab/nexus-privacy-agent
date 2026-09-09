@@ -234,11 +234,13 @@ export async function perceiveScreenshot(screenshotDataUrl: string): Promise<Per
     return {
       visualRegions: [],
       metrics: {
-        totalDurationMs: 0,
-        candidateBandsDetected: 0,
-        ocrInferenceDurationMs: 0,
+        loadTimeMs: 0,
+        inferenceTimeMs: 0,
+        totalTimeMs: 0,
         provider: 'wasm',
-        isWarm: false,
+        isWarmRun: false,
+        latencyBudgetExceeded: false,
+        memoryBudgetExceeded: false,
       },
     };
   }
@@ -262,11 +264,13 @@ export async function perceiveScreenshot(screenshotDataUrl: string): Promise<Per
     return {
       visualRegions: [],
       metrics: {
-        totalDurationMs: Math.round(performance.now() - totalStart),
-        candidateBandsDetected: 0,
-        ocrInferenceDurationMs: 0,
+        loadTimeMs: Math.round(performance.now() - totalStart),
+        inferenceTimeMs: 0,
+        totalTimeMs: Math.round(performance.now() - totalStart),
         provider,
-        isWarm: false,
+        isWarmRun: false,
+        latencyBudgetExceeded: false,
+        memoryBudgetExceeded: false,
       },
     };
   }
@@ -281,11 +285,13 @@ export async function perceiveScreenshot(screenshotDataUrl: string): Promise<Per
     return {
       visualRegions: [],
       metrics: {
-        totalDurationMs: Math.round(performance.now() - totalStart),
-        candidateBandsDetected: 0,
-        ocrInferenceDurationMs: 0,
+        loadTimeMs: 0,
+        inferenceTimeMs: 0,
+        totalTimeMs: Math.round(performance.now() - totalStart),
         provider,
-        isWarm,
+        isWarmRun: isWarm,
+        latencyBudgetExceeded: false,
+        memoryBudgetExceeded: false,
       },
     };
   }

@@ -201,10 +201,18 @@ export function clearPagePrivacyMasks() {
   }
 }
 
+let isShieldActive = true;
+let isProactiveAutoScanEnabled = true;
+
 /**
  * Proactively scans the webpage for sensitive PII and applies on-screen redaction masks directly.
  */
 export async function autoScanAndMask() {
+  if (!isShieldActive || !isProactiveAutoScanEnabled) {
+    clearPagePrivacyMasks();
+    return;
+  }
+
   try {
     const dom = extractDom();
     if (!dom || dom.length === 0) return;
@@ -230,7 +238,7 @@ export async function autoScanAndMask() {
       }
     }
 
-    if (masks.length > 0) {
+    if (masks.length > 0 && isShieldActive) {
       renderPagePrivacyMasks(masks);
       console.log(`[Nexus Privacy Agent] 🛡️ Proactive Auto-Masking applied: ${masks.length} sensitive element(s) shielded from agent vision.`);
     } else {
@@ -251,19 +259,68 @@ export default defineContentScript({
       // ignore
     }
 
+    // 0. Sync power and proactive shield state from storage
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        chrome.storage.local.get(['nexus_extension_active', 'nexus_proactive_shield'], (res) => {
+          if (res && res.nexus_extension_active !== undefined) {
+            isShieldActive = Boolean(res.nexus_extension_active);
+          }
+          if (res && res.nexus_proactive_shield !== undefined) {
+            isProactiveAutoScanEnabled = Boolean(res.nexus_proactive_shield);
+          }
+          if (isShieldActive && isProactiveAutoScanEnabled) {
+            setTimeout(autoScanAndMask, 300);
+          } else {
+            clearPagePrivacyMasks();
+          }
+        });
+
+        // Listen for user toggle events across all open browser tabs
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area === 'local') {
+            if (changes.nexus_extension_active !== undefined) {
+              isShieldActive = Boolean(changes.nexus_extension_active.newValue);
+              if (!isShieldActive) {
+                clearPagePrivacyMasks();
+                console.log('[Nexus Privacy Agent] 🛑 Privacy Shield paused by user.');
+              } else if (isProactiveAutoScanEnabled) {
+                console.log('[Nexus Privacy Agent] ▶️ Privacy Shield activated by user.');
+                autoScanAndMask();
+              }
+            }
+            if (changes.nexus_proactive_shield !== undefined) {
+              isProactiveAutoScanEnabled = Boolean(changes.nexus_proactive_shield.newValue);
+              if (!isProactiveAutoScanEnabled) {
+                clearPagePrivacyMasks();
+              } else if (isShieldActive) {
+                autoScanAndMask();
+              }
+            }
+          }
+        });
+      }
+    } catch {
+      // fallback
+    }
+
     // 1. Proactive auto-scan when page loads
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => {
-        setTimeout(autoScanAndMask, 300);
+        if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 300);
       });
     } else {
-      setTimeout(autoScanAndMask, 300);
+      if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 300);
     }
-    window.addEventListener('load', () => setTimeout(autoScanAndMask, 500));
+    window.addEventListener('load', () => {
+      if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 500);
+    });
 
     // 2. Watch for dynamic form inputs or DOM additions (debounced)
     let mutationTimer: any = null;
     const observer = new MutationObserver((mutations) => {
+      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
+
       let isOurSelf = false;
       for (const m of mutations) {
         if (
@@ -289,22 +346,41 @@ export default defineContentScript({
     }
 
     document.addEventListener('input', () => {
+      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 300);
     });
 
     window.addEventListener('scroll', () => {
+      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 80);
     }, { passive: true });
 
     window.addEventListener('resize', () => {
+      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 100);
     }, { passive: true });
 
     // 3. Message handlers for extension popup and background worker
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message && message.type === 'SET_SHIELD_ACTIVE') {
+        isShieldActive = Boolean(message.active);
+        if (!isShieldActive) {
+          clearPagePrivacyMasks();
+        } else if (isProactiveAutoScanEnabled) {
+          autoScanAndMask();
+        }
+        sendResponse({ success: true, active: isShieldActive });
+        return true;
+      }
+
+      if (message && message.type === 'GET_SHIELD_STATUS') {
+        sendResponse({ active: isShieldActive, proactive: isProactiveAutoScanEnabled });
+        return true;
+      }
+
       if (message && message.type === 'AUTO_SCAN_PRIVACY') {
         autoScanAndMask().then(() => sendResponse({ success: true }));
         return true;
@@ -318,8 +394,13 @@ export default defineContentScript({
       }
 
       if (message && message.type === 'RENDER_PAGE_MASKS') {
-        renderPagePrivacyMasks(message.masks || []);
-        sendResponse({ success: true, count: (message.masks || []).length });
+        if (isShieldActive) {
+          renderPagePrivacyMasks(message.masks || []);
+          sendResponse({ success: true, count: (message.masks || []).length });
+        } else {
+          clearPagePrivacyMasks();
+          sendResponse({ success: false, reason: 'Shield paused' });
+        }
         return true;
       }
 
