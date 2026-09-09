@@ -211,8 +211,18 @@ export default function App() {
   };
 
   const handleOpenTestFixture = async () => {
-    const fixtureUrl = chrome.runtime.getURL('test-fixtures/mock-id-card.html');
-    await chrome.tabs.create({ url: fixtureUrl });
+    try {
+      const demoUrl = serverStatus === 'online' ? 'http://127.0.0.1:8000/demo' : chrome.runtime.getURL('test-fixtures/mock-id-card.html');
+      const tab = await chrome.tabs.create({ url: demoUrl, active: true });
+      if (tab && tab.id) {
+        setCapturedTabId(tab.id);
+        setTimeout(() => {
+          handleCaptureContext(tab.id);
+        }, 800);
+      }
+    } catch (e) {
+      console.warn('Could not open test fixture tab:', e);
+    }
   };
 
   // Load persisted policy, check server, and auto-capture context on mount
@@ -224,7 +234,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const handleCaptureContext = async () => {
+  const handleCaptureContext = async (overrideTabId?: number | null) => {
     setLoading(true);
     setVisionLoading(false);
     setSanitizing(false);
@@ -234,27 +244,37 @@ export default function App() {
       // 1. Locate the target webpage tab
       let targetTab: chrome.tabs.Tab | undefined;
 
-      const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (
-        currentActive &&
-        currentActive.url &&
-        !currentActive.url.startsWith('chrome-extension://') &&
-        !currentActive.url.startsWith('chrome://') &&
-        !currentActive.url.startsWith('edge://') &&
-        !currentActive.url.startsWith('about:')
-      ) {
-        targetTab = currentActive;
+      if (overrideTabId) {
+        try {
+          targetTab = await chrome.tabs.get(overrideTabId);
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!targetTab) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (
+          currentActive &&
+          currentActive.url &&
+          !currentActive.url.startsWith('chrome://') &&
+          !currentActive.url.startsWith('edge://') &&
+          !currentActive.url.startsWith('about:')
+        ) {
+          targetTab = currentActive;
+        }
       }
 
       if (!targetTab) {
         const allTabs = await chrome.tabs.query({});
         targetTab =
+          allTabs.find((t) => t.url && t.url.includes('127.0.0.1:8000')) ||
+          allTabs.find((t) => t.url && t.url.includes('mock-id-card')) ||
           allTabs.find((t) => t.active && t.url && /^https?:\/\//i.test(t.url)) ||
           allTabs.find((t) => t.url && /^https?:\/\//i.test(t.url)) ||
           allTabs.find(
             (t) =>
               t.url &&
-              !t.url.startsWith('chrome-extension://') &&
               !t.url.startsWith('chrome://') &&
               !t.url.startsWith('edge://') &&
               !t.url.startsWith('about:')
@@ -262,7 +282,7 @@ export default function App() {
       }
 
       if (!targetTab || targetTab.id === undefined) {
-        throw new Error('No target webpage found. Please open a webpage and try again.');
+        throw new Error('Please open or switch to a webpage tab (e.g. google.com or our test page). Chrome prevents extensions from capturing internal chrome:// pages.');
       }
       setCapturedTabId(targetTab.id);
 
@@ -804,7 +824,28 @@ export default function App() {
             </button>
           </div>
 
-          {error && <div className="error-banner">⚠️ {error}</div>}
+          {error && (
+            <div className="error-banner" style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px' }}>
+              <div>⚠️ {error}</div>
+              <button
+                onClick={handleOpenTestFixture}
+                type="button"
+                style={{
+                  background: '#2563eb',
+                  color: '#ffffff',
+                  border: 'none',
+                  padding: '6px 12px',
+                  borderRadius: '4px',
+                  fontSize: '0.75rem',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  alignSelf: 'flex-start',
+                }}
+              >
+                🌐 Open Live Test Page (127.0.0.1:8000/demo)
+              </button>
+            </div>
+          )}
 
           {!safeContext ? (
             <div className="task-card" style={{ textAlign: 'center', padding: '20px 14px' }}>
@@ -813,7 +854,7 @@ export default function App() {
                 Zero-Leak Privacy Boundary
               </strong>
               <p style={{ fontSize: '0.76rem', color: '#64748b', lineHeight: 1.45, margin: 0 }}>
-                Click <strong>Capture &amp; Sanitize Context</strong> above or launch the synthetic test fixture to test on-device perception and visual grounding.
+                Open a test page to test on-device perception, Privacy Gate redaction, and ZonUI-3B visual grounding.
               </p>
               <button
                 className="fixture-launch-btn"
@@ -822,7 +863,7 @@ export default function App() {
                 id="launch-fixture-btn"
               >
                 <span>📄</span>
-                <span>Launch Mock ID Card Test Page</span>
+                <span>Launch Interactive Demo Test Page</span>
               </button>
             </div>
           ) : (

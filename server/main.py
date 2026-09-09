@@ -10,6 +10,7 @@ import time
 import logging
 from typing import List, Dict, Any, Optional, Literal
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -90,6 +91,24 @@ def health_check():
         "endpoint": cfg["endpoint"] if cfg["mode"] == "REMOTE_API" else "local",
         "privacyBoundary": "SafeContext-enforced",
     }
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def get_demo_page():
+    demo_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test-page", "index.html")
+    if os.path.exists(demo_path):
+        with open(demo_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Nexus Privacy Agent Demo Page</h1>"
+
+
+@app.get("/fixture", response_class=HTMLResponse)
+def get_fixture_page():
+    fixture_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "test-fixtures", "mock-id-card.html")
+    if os.path.exists(fixture_path):
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h1>Nexus Privacy Agent Fixture</h1>"
 
 
 @app.get("/server/config")
