@@ -52,56 +52,6 @@ export default function App() {
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [capturedTabId, setCapturedTabId] = useState<number | null>(null);
   const [pageMasksVisible, setPageMasksVisible] = useState(false);
-  const [openTabsList, setOpenTabsList] = useState<{ id: number; title: string; url: string }[]>([]);
-
-  const isFullPage =
-    typeof window !== 'undefined' &&
-    (window.innerWidth > 600 ||
-      window.location.search.includes('mode=full') ||
-      (window.location.protocol.startsWith('chrome-extension:') && window.location.pathname.includes('popup.html') && window.innerWidth > 580));
-
-  const refreshOpenTabs = async () => {
-    if (typeof chrome !== 'undefined' && chrome.tabs) {
-      try {
-        const tabs = await chrome.tabs.query({});
-        const filtered = tabs
-          .filter(
-            (t) =>
-              t.id &&
-              t.url &&
-              !t.url.startsWith('chrome://') &&
-              !t.url.startsWith('edge://') &&
-              !t.url.startsWith('about:') &&
-              !t.url.includes('popup.html')
-          )
-          .map((t) => ({
-            id: t.id!,
-            title: t.title || t.url || 'Web Page Tab',
-            url: t.url || '',
-          }));
-        setOpenTabsList(filtered);
-      } catch {
-        // ignore
-      }
-    }
-  };
-
-  const handleOpenFullDashboard = () => {
-    if (typeof chrome !== 'undefined' && chrome.tabs) {
-      chrome.tabs.create({ url: chrome.runtime.getURL('popup.html?mode=full') });
-    }
-  };
-
-  const handleOpenPopoutWindow = () => {
-    if (typeof chrome !== 'undefined' && chrome.windows) {
-      chrome.windows.create({
-        url: chrome.runtime.getURL('popup.html?mode=full'),
-        type: 'popup',
-        width: 1100,
-        height: 860,
-      });
-    }
-  };
 
   const applyPageMasks = async (ctx: SafeContext, tabId?: number | null) => {
     let targetTabId = tabId || capturedTabId;
@@ -290,13 +240,9 @@ export default function App() {
         }
       });
     }
-    refreshOpenTabs();
     checkServerHealth();
     handleCaptureContext();
-    const interval = setInterval(() => {
-      checkServerHealth();
-      refreshOpenTabs();
-    }, 5000);
+    const interval = setInterval(checkServerHealth, 6000);
     return () => clearInterval(interval);
   }, []);
 
@@ -382,9 +328,7 @@ export default function App() {
           currentActive.url &&
           !currentActive.url.startsWith('chrome://') &&
           !currentActive.url.startsWith('edge://') &&
-          !currentActive.url.startsWith('about:') &&
-          !currentActive.url.includes('popup.html') &&
-          !currentActive.url.startsWith('chrome-extension://')
+          !currentActive.url.startsWith('about:')
         ) {
           targetTab = currentActive;
         }
@@ -393,31 +337,16 @@ export default function App() {
       if (!targetTab) {
         const allTabs = await chrome.tabs.query({});
         targetTab =
-          allTabs.find((t) => t.url && t.url.includes('127.0.0.1:8000') && !t.url.includes('popup.html')) ||
-          allTabs.find((t) => t.url && t.url.includes('mock-id-card') && !t.url.includes('popup.html')) ||
-          allTabs.find(
-            (t) =>
-              t.active &&
-              t.url &&
-              /^https?:\/\//i.test(t.url) &&
-              !t.url.includes('popup.html') &&
-              !t.url.startsWith('chrome-extension://')
-          ) ||
-          allTabs.find(
-            (t) =>
-              t.url &&
-              /^https?:\/\//i.test(t.url) &&
-              !t.url.includes('popup.html') &&
-              !t.url.startsWith('chrome-extension://')
-          ) ||
+          allTabs.find((t) => t.url && t.url.includes('127.0.0.1:8000')) ||
+          allTabs.find((t) => t.url && t.url.includes('mock-id-card')) ||
+          allTabs.find((t) => t.active && t.url && /^https?:\/\//i.test(t.url)) ||
+          allTabs.find((t) => t.url && /^https?:\/\//i.test(t.url)) ||
           allTabs.find(
             (t) =>
               t.url &&
               !t.url.startsWith('chrome://') &&
               !t.url.startsWith('edge://') &&
-              !t.url.startsWith('about:') &&
-              !t.url.includes('popup.html') &&
-              !t.url.startsWith('chrome-extension://')
+              !t.url.startsWith('about:')
           );
       }
 
@@ -849,95 +778,27 @@ export default function App() {
   };
 
   return (
-    <div className={`agent-container ${isFullPage ? 'full-page-mode' : ''}`}>
+    <div className="agent-container">
       <header className="agent-header">
         <div className="header-top-row">
           <div className="header-title-col">
-            <div className="title-with-badge">
-              <h1 className="agent-title">Nexus Privacy Agent</h1>
-              {isFullPage ? (
-                <span className="full-mode-tag">🖥️ Full Dashboard</span>
-              ) : null}
-            </div>
+            <h1 className="agent-title">Nexus Privacy Agent</h1>
             <p className="agent-subtitle">Phase 5: Visual Grounding &amp; Defense-in-Depth</p>
           </div>
-          <div className="header-actions-col">
-            {!isFullPage && (
-              <div className="view-mode-buttons">
-                <button
-                  type="button"
-                  className="view-mode-btn"
-                  onClick={handleOpenFullDashboard}
-                  title="Expand to Full Page Dashboard Tab"
-                >
-                  ⛶ Full Tab
-                </button>
-                <button
-                  type="button"
-                  className="view-mode-btn"
-                  onClick={handleOpenPopoutWindow}
-                  title="Open in Resizable Popout Window"
-                >
-                  🗖 Window
-                </button>
-              </div>
-            )}
-            <div className="master-power-toggle">
-              <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
-                {extensionActive ? 'SHIELD ON' : 'SHIELD OFF'}
-              </span>
-              <button
-                type="button"
-                className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
-                onClick={handleToggleExtensionActive}
-                title={extensionActive ? 'Click to Pause Nexus Privacy Shield' : 'Click to Enable Nexus Privacy Shield'}
-                id="master-power-switch-btn"
-              >
-                <span className="switch-knob"></span>
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Target Tab Selector Bar for Flexibility */}
-        <div className="target-tab-bar">
-          <div className="target-tab-info">
-            <span className="target-tab-icon">🎯</span>
-            <label htmlFor="target-tab-select" className="target-tab-label">Target Page:</label>
-            <select
-              id="target-tab-select"
-              className="target-tab-select"
-              value={capturedTabId || ''}
-              onChange={(e) => {
-                const tabId = Number(e.target.value);
-                if (tabId) {
-                  setCapturedTabId(tabId);
-                  handleCaptureContext(tabId);
-                }
-              }}
+          <div className="master-power-toggle">
+            <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
+              {extensionActive ? 'SHIELD ON' : 'SHIELD OFF'}
+            </span>
+            <button
+              type="button"
+              className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
+              onClick={handleToggleExtensionActive}
+              title={extensionActive ? 'Click to Pause Nexus Privacy Shield' : 'Click to Enable Nexus Privacy Shield'}
+              id="master-power-switch-btn"
             >
-              {openTabsList.length === 0 ? (
-                <option value="">(Active Browser Tab)</option>
-              ) : (
-                openTabsList.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.title.length > 55 ? t.title.substring(0, 55) + '...' : t.title}
-                  </option>
-                ))
-              )}
-            </select>
+              <span className="switch-knob"></span>
+            </button>
           </div>
-          <button
-            type="button"
-            className="target-tab-refresh-btn"
-            onClick={() => {
-              refreshOpenTabs();
-              handleCaptureContext(capturedTabId);
-            }}
-            title="Refresh Active Tabs & Recapture Page Context"
-          >
-            🔄 Sync Page
-          </button>
         </div>
       </header>
 

@@ -1,15 +1,14 @@
 .agent-container {
-  padding: 16px;
+  padding: 14px;
   background: #ffffff;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   color: #1e293b;
-  min-height: 100%;
 }
 
 .agent-header {
-  margin-bottom: 14px;
+  margin-bottom: 12px;
   border-bottom: 1px solid #e2e8f0;
-  padding-bottom: 12px;
+  padding-bottom: 10px;
 }
 
 .header-top-row {
@@ -17,35 +16,17 @@
   justify-content: space-between;
   align-items: center;
   text-align: left;
-  gap: 12px;
 }
 
 .header-title-col {
   flex: 1;
 }
 
-.title-with-badge {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .agent-title {
   margin: 0;
-  font-size: 1.3rem;
+  font-size: 1.25rem;
   font-weight: 700;
   color: #0f172a;
-  letter-spacing: -0.02em;
-}
-
-.full-mode-tag {
-  background: #eff6ff;
-  color: #2563eb;
-  border: 1px solid #bfdbfe;
-  font-size: 0.72rem;
-  font-weight: 700;
-  padding: 2px 8px;
-  border-radius: 9999px;
 }
 
 .agent-subtitle {
@@ -53,107 +34,6 @@
   font-size: 0.78rem;
   color: #64748b;
   font-weight: 500;
-}
-
-.header-actions-col {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-/* View Mode Buttons (Full Tab / Window) */
-.view-mode-buttons {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.view-mode-btn {
-  background: #f1f5f9;
-  color: #334155;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  padding: 4px 9px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.view-mode-btn:hover {
-  background: #e2e8f0;
-  color: #0f172a;
-  border-color: #94a3b8;
-}
-
-/* Target Tab Selector Bar */
-.target-tab-bar {
-  margin-top: 10px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 6px 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.target-tab-info {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-
-.target-tab-icon {
-  font-size: 0.85rem;
-}
-
-.target-tab-label {
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: #475569;
-  white-space: nowrap;
-}
-
-.target-tab-select {
-  flex: 1;
-  min-width: 0;
-  font-size: 0.75rem;
-  padding: 3px 8px;
-  border: 1px solid #cbd5e1;
-  border-radius: 4px;
-  background: #ffffff;
-  color: #1e293b;
-  outline: none;
-  cursor: pointer;
-}
-
-.target-tab-select:focus {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
-}
-
-.target-tab-refresh-btn {
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  border-radius: 4px;
-  padding: 3px 8px;
-  font-size: 0.72rem;
-  font-weight: 600;
-  color: #334155;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.15s ease;
-}
-
-.target-tab-refresh-btn:hover {
-  background: #f1f5f9;
 }
 
 /* Master Power Toggle Styles */
