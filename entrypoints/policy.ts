@@ -45,14 +45,16 @@ export function resolvePolicyAction(policy: PolicyRecord, category: string): Pol
  */
 export async function getPolicy(): Promise<PolicyRecord> {
   try {
-    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+    if (typeof chrome !== 'undefined' && chrome.runtime?.id && chrome.storage?.local) {
       const data = await chrome.storage.local.get(STORAGE_KEY);
       if (data && data[STORAGE_KEY]) {
         return { ...DEFAULT_POLICY, ...data[STORAGE_KEY] };
       }
     }
-  } catch (err) {
-    console.warn('[Nexus Privacy Agent] getPolicy error:', err);
+  } catch (err: any) {
+    if (!err?.message?.includes('Extension context invalidated')) {
+      console.warn('[Nexus Privacy Agent] getPolicy error:', err);
+    }
   }
   return { ...DEFAULT_POLICY };
 }

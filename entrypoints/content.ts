@@ -204,10 +204,22 @@ export function clearPagePrivacyMasks() {
 let isShieldActive = true;
 let isProactiveAutoScanEnabled = true;
 
+function isContextValid(): boolean {
+  try {
+    return typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Proactively scans the webpage for sensitive PII and applies on-screen redaction masks directly.
  */
 export async function autoScanAndMask() {
+  if (!isContextValid()) {
+    clearPagePrivacyMasks();
+    return;
+  }
   if (!isShieldActive || !isProactiveAutoScanEnabled) {
     clearPagePrivacyMasks();
     return;
@@ -244,8 +256,10 @@ export async function autoScanAndMask() {
     } else {
       clearPagePrivacyMasks();
     }
-  } catch (err) {
-    console.warn('[Nexus Privacy Agent] autoScanAndMask error:', err);
+  } catch (err: any) {
+    if (!err?.message?.includes('Extension context invalidated')) {
+      console.warn('[Nexus Privacy Agent] autoScanAndMask error:', err);
+    }
   }
 }
 
@@ -319,6 +333,13 @@ export default defineContentScript({
     // 2. Watch for dynamic form inputs or DOM additions (debounced)
     let mutationTimer: any = null;
     const observer = new MutationObserver((mutations) => {
+      if (!isContextValid()) {
+        try {
+          observer.disconnect();
+          clearPagePrivacyMasks();
+        } catch {}
+        return;
+      }
       if (!isShieldActive || !isProactiveAutoScanEnabled) return;
 
       let isOurSelf = false;
@@ -346,19 +367,19 @@ export default defineContentScript({
     }
 
     document.addEventListener('input', () => {
-      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
+      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 300);
     });
 
     window.addEventListener('scroll', () => {
-      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
+      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 80);
     }, { passive: true });
 
     window.addEventListener('resize', () => {
-      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
+      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
       clearTimeout(mutationTimer);
       mutationTimer = setTimeout(autoScanAndMask, 100);
     }, { passive: true });
