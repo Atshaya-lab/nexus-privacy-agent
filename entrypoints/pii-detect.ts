@@ -3,13 +3,28 @@ import type { DomNode, VisualRegion, PiiClassification } from '@/types';
 // Regex patterns for value matching
 const AADHAAR_REGEX = /\b\d{4}\s?\d{4}\s?\d{4}\b/;
 const PAN_REGEX = /\b[A-Z]{5}\d{4}[A-Z]\b/i;
-const PHONE_REGEX = /(\+91[\-\s]?)?[6-9]\d{9}|\b\d{3}[-\s.]?\d{3}[-\s.]?\d{4}\b/;
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const PHONE_REGEX = /(?:\+91[\-\s]?)?[6-9]\d{9}|\b\d{3}[-\s.]?\d{3}[-\s.]?\d{4}\b/;
+const EMAIL_REGEX = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/;
 const AMOUNT_REGEX = /(?:₹|rs\.?|inr|\$|€|£)\s?\d+(?:,\d+)*(?:\.\d+)?/i;
 const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/;
 const CREDIT_CARD_REGEX = /\b(?:\d{4}[-\s]?){3}\d{4}\b/;
+const API_KEY_REGEX = /\b(?:sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|hf_[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z-_]{35}|bearer\s+[a-zA-Z0-9_\-\.]{20,}|(?:ey[a-zA-Z0-9_-]{15,}\.ey[a-zA-Z0-9_-]{15,}\.[a-zA-Z0-9_-]{15,}))\b/i;
 
-// Label patterns for label-proximity classification
+// Label patterns for input attribute inspection (id, name, placeholder, autocomplete)
+const INPUT_LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
+  { category: 'password', regex: /\b(password|passwd|pass|pwd|secret|token|api[_\s-]?key|auth|pin|cvv|cvc)\b/i },
+  { category: 'aadhaar', regex: /\b(aadhaar|adhaar|aadhar|uidai|abdhaar)\b/i },
+  { category: 'pan', regex: /\b(pan|p\.a\.n|permanent\s*account)\b|^-?pan[:\s]/i },
+  { category: 'ssn', regex: /\b(ssn|social\s*security|tax\s*id)\b/i },
+  { category: 'credit_card', regex: /\b(card|credit|debit|cardnumber|cc-num|cc_number)\b/i },
+  { category: 'phone', regex: /\b(phone|mobile|tel|telephone|cell|contact\s*no)\b/i },
+  { category: 'email', regex: /\b(email|e-mail)\b/i },
+  { category: 'name', regex: /\b(fullname|full_name|firstname|first_name|lastname|last_name|holder_name)\b/i },
+  { category: 'dob', regex: /\b(dob|birthdate|date_of_birth|birth_date)\b/i },
+  { category: 'address', regex: /\b(address|street|residence|addr_line)\b/i },
+];
+
+// Label patterns for visual OCR proximity
 const LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
   { category: 'aadhaar', regex: /\b(aadhaar|adhaar|aadhar|uidai|abdhaar|aadha|adha)\b/i },
   { category: 'pan', regex: /\b(pan|p\.a\.n|permanent\s*account)\b|^-?pan[:\s]/i },
@@ -32,7 +47,7 @@ const DOCUMENT_CHROME_REGEX =
 
 /**
  * Classifies both DOM text nodes and visual text regions into categories.
- * Implements regex detection + label-proximity spatial detection.
+ * Implements regex detection + input attribute classification + label-proximity spatial detection.
  */
 export function detectPii(
   domNodes: DomNode[] = [],
@@ -48,12 +63,7 @@ export function detectPii(
   // Pass 1: In-region regex & direct label match
   visualRegions.forEach((region, index) => {
     const rawText = region.extractedText.trim();
-    if (!rawText) return;
-
-    // Check if it's document chrome / banner
-    if (DOCUMENT_CHROME_REGEX.test(rawText)) {
-      return; // Skip document chrome
-    }
+    if (!rawText || DOCUMENT_CHROME_REGEX.test(rawText)) return;
 
     // A. Regex value detections (includes matchedText)
     const aadhaarMatch = rawText.match(AADHAAR_REGEX);
@@ -116,6 +126,21 @@ export function detectPii(
       return;
     }
 
+    const apiKeyMatch = rawText.match(API_KEY_REGEX);
+    if (apiKeyMatch) {
+      classifications.push({
+        category: 'password',
+        source: 'visual',
+        bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
+        matchedText: apiKeyMatch[0],
+        confidenceInDetection: 0.99,
+        originalIndex: index,
+        originalItem: region,
+      });
+      visualClassified.add(index);
+      return;
+    }
+
     const amountMatch = rawText.match(AMOUNT_REGEX);
     if (amountMatch) {
       classifications.push({
@@ -131,8 +156,7 @@ export function detectPii(
       return;
     }
 
-    // B. Label-based classification within the region (e.g. "Name: Rahul", "-PAN: ABCDE124F")
-    // NOTE: matchedText is omitted for label-proximity-only detections per requirement
+    // B. Label-based classification within the region
     for (const item of LABEL_PATTERNS) {
       if (item.regex.test(rawText)) {
         classifications.push({
@@ -149,14 +173,13 @@ export function detectPii(
     }
   });
 
-  // Pass 2: Spatial label proximity between adjacent visual regions (multi-box layouts)
+  // Pass 2: Spatial label proximity between adjacent visual regions
   visualRegions.forEach((regionB, indexB) => {
     if (visualClassified.has(indexB)) return;
 
     const rawTextB = regionB.extractedText.trim();
     if (!rawTextB || DOCUMENT_CHROME_REGEX.test(rawTextB)) return;
 
-    // Check if regionB is spatially adjacent to any classified regionA that acted as a label
     for (const classified of classifications) {
       if (classified.source !== 'visual') continue;
 
@@ -168,11 +191,9 @@ export function detectPii(
         height: regionB.bbox.h,
       };
 
-      // Same horizontal row (adjacent on right within 180px)
       const sameRow = Math.abs(boxA.y - boxB.y) <= Math.max(boxA.height, boxB.height) * 0.9;
       const isRightNeighbor = boxB.x >= boxA.x && boxB.x - (boxA.x + boxA.width) < 180;
 
-      // Same vertical column: only if boxA was a short label-only prompt (not already containing a full value)
       const textA = (classified.originalItem?.extractedText || '').trim();
       const isLabelOnlyA = !textA.includes(':') || textA.endsWith(':') || textA.length <= 10;
       const sameCol = Math.abs(boxA.x - boxB.x) <= 80;
@@ -193,37 +214,34 @@ export function detectPii(
     }
   });
 
-  // Pass 3: Hard fail-safe: Any unclassified visual region on canvas/UI defaults to 'unclassified'
-  visualRegions.forEach((region, index) => {
-    if (visualClassified.has(index)) return;
-
-    const rawText = region.extractedText.trim();
-    if (!rawText || DOCUMENT_CHROME_REGEX.test(rawText)) return;
-
-    // Region is unclassified text content: tag as 'unclassified'
-    classifications.push({
-      category: 'unclassified',
-      source: 'visual',
-      bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
-      confidenceInDetection: 0.7,
-      originalIndex: index,
-      originalItem: region,
-    });
-    visualClassified.add(index);
-  });
-
   // ==========================================
   // 2. CLASSIFY DOM TEXT NODES (PHASE 1)
   // ==========================================
   domNodes.forEach((node, nodeIdx) => {
-    if (node.tag === 'canvas') return; // Canvas content handled visually
+    if (node.tag === 'canvas') return;
 
-    const combinedText = `${node.text || ''} ${node.attributes?.value || ''}`.trim();
-    const combinedAttrs = `${node.attributes?.name || ''} ${node.attributes?.id || ''} ${
+    // Never mask action buttons, navigation links, or section headings as PII
+    const isActionOrHeading =
+      node.tag === 'button' ||
+      node.role === 'button' ||
+      node.tag === 'a' ||
+      node.tag === 'h1' ||
+      node.tag === 'h2' ||
+      node.tag === 'h3' ||
+      node.tag === 'h4' ||
+      node.tag === 'h5' ||
+      node.tag === 'h6' ||
+      node.tag === 'label';
+
+    const isInputField = node.tag === 'input' || node.tag === 'textarea' || node.tag === 'select';
+
+    const nodeText = (node.text || '').trim();
+    const nodeVal = (node.attributes?.value || '').trim();
+    const combinedValueText = `${nodeVal || (isInputField ? '' : nodeText)}`.trim();
+    const inputAttrs = `${node.attributes?.name || ''} ${node.attributes?.id || ''} ${
       node.attributes?.placeholder || ''
-    } ${node.attributes?.type || ''}`.toLowerCase();
-
-    if (!combinedText && !combinedAttrs) return;
+    } ${node.attributes?.['aria-label'] || ''} ${node.attributes?.autocomplete || ''}`.toLowerCase();
+    const inputType = (node.attributes?.type || '').toLowerCase();
 
     const bbox = {
       x: node.boundingBox.x,
@@ -232,117 +250,162 @@ export function detectPii(
       height: node.boundingBox.height,
     };
 
-    // A. Regex value detections
-    const aadhaarMatch = combinedText.match(AADHAAR_REGEX);
-    if (aadhaarMatch) {
+    // 1. Password input type -> Immediate MASK
+    if (isInputField && (inputType === 'password' || inputAttrs.includes('password') || inputAttrs.includes('secret') || inputAttrs.includes('token') || inputAttrs.includes('api_key') || inputAttrs.includes('apikey'))) {
       classifications.push({
-        category: 'aadhaar',
+        category: 'password',
         source: 'dom',
         bbox,
-        matchedText: aadhaarMatch[0],
-        confidenceInDetection: 0.98,
+        matchedText: nodeVal ? '********' : undefined,
+        confidenceInDetection: 0.99,
         originalIndex: nodeIdx,
         originalItem: node,
       });
       return;
     }
 
-    const panMatch = combinedText.match(PAN_REGEX);
-    if (panMatch) {
-      classifications.push({
-        category: 'pan',
-        source: 'dom',
-        bbox,
-        matchedText: panMatch[0],
-        confidenceInDetection: 0.98,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
+    // 2. Value Regex Detections (high-confidence pattern match on actual data)
+    const textToCheck = isInputField ? (nodeVal || nodeText) : nodeText;
 
-    const phoneMatch = combinedText.match(PHONE_REGEX);
-    if (phoneMatch) {
-      classifications.push({
-        category: 'phone',
-        source: 'dom',
-        bbox,
-        matchedText: phoneMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const emailMatch = combinedText.match(EMAIL_REGEX);
-    if (emailMatch) {
-      classifications.push({
-        category: 'email',
-        source: 'dom',
-        bbox,
-        matchedText: emailMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const amountMatch = combinedText.match(AMOUNT_REGEX);
-    if (amountMatch) {
-      classifications.push({
-        category: 'amount',
-        source: 'dom',
-        bbox,
-        matchedText: amountMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const ssnMatch = combinedText.match(SSN_REGEX);
-    if (ssnMatch) {
-      classifications.push({
-        category: 'ssn',
-        source: 'dom',
-        bbox,
-        matchedText: ssnMatch[0],
-        confidenceInDetection: 0.98,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const ccMatch = combinedText.match(CREDIT_CARD_REGEX);
-    if (ccMatch) {
-      classifications.push({
-        category: 'credit_card',
-        source: 'dom',
-        bbox,
-        matchedText: ccMatch[0],
-        confidenceInDetection: 0.98,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    // B. Label & Attribute-based classification
-    for (const item of LABEL_PATTERNS) {
-      if (item.regex.test(combinedAttrs) || item.regex.test(combinedText)) {
+    if (textToCheck) {
+      const apiKeyMatch = textToCheck.match(API_KEY_REGEX);
+      if (apiKeyMatch) {
         classifications.push({
-          category: item.category,
+          category: 'password',
           source: 'dom',
           bbox,
-          confidenceInDetection: 0.9,
+          matchedText: apiKeyMatch[0],
+          confidenceInDetection: 0.99,
           originalIndex: nodeIdx,
           originalItem: node,
         });
         return;
+      }
+
+      const aadhaarMatch = textToCheck.match(AADHAAR_REGEX);
+      if (aadhaarMatch) {
+        classifications.push({
+          category: 'aadhaar',
+          source: 'dom',
+          bbox,
+          matchedText: aadhaarMatch[0],
+          confidenceInDetection: 0.98,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      const panMatch = textToCheck.match(PAN_REGEX);
+      if (panMatch) {
+        classifications.push({
+          category: 'pan',
+          source: 'dom',
+          bbox,
+          matchedText: panMatch[0],
+          confidenceInDetection: 0.98,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      const ssnMatch = textToCheck.match(SSN_REGEX);
+      if (ssnMatch) {
+        classifications.push({
+          category: 'ssn',
+          source: 'dom',
+          bbox,
+          matchedText: ssnMatch[0],
+          confidenceInDetection: 0.98,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      const ccMatch = textToCheck.match(CREDIT_CARD_REGEX);
+      if (ccMatch) {
+        classifications.push({
+          category: 'credit_card',
+          source: 'dom',
+          bbox,
+          matchedText: ccMatch[0],
+          confidenceInDetection: 0.98,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      const phoneMatch = textToCheck.match(PHONE_REGEX);
+      if (phoneMatch) {
+        classifications.push({
+          category: 'phone',
+          source: 'dom',
+          bbox,
+          matchedText: phoneMatch[0],
+          confidenceInDetection: 0.95,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      const emailMatch = textToCheck.match(EMAIL_REGEX);
+      if (emailMatch) {
+        classifications.push({
+          category: 'email',
+          source: 'dom',
+          bbox,
+          matchedText: emailMatch[0],
+          confidenceInDetection: 0.95,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+    }
+
+    // 3. Form Input Attribute Classification (ONLY for <input>, <textarea>, <select>)
+    // Never classify static headings, labels, or buttons by attribute keywords!
+    if (isInputField) {
+      if (inputType === 'email') {
+        classifications.push({
+          category: 'email',
+          source: 'dom',
+          bbox,
+          confidenceInDetection: 0.95,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      if (inputType === 'tel') {
+        classifications.push({
+          category: 'phone',
+          source: 'dom',
+          bbox,
+          confidenceInDetection: 0.95,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
+      }
+
+      for (const item of INPUT_LABEL_PATTERNS) {
+        if (item.regex.test(inputAttrs)) {
+          classifications.push({
+            category: item.category,
+            source: 'dom',
+            bbox,
+            confidenceInDetection: 0.92,
+            originalIndex: nodeIdx,
+            originalItem: node,
+          });
+          return;
+        }
       }
     }
   });
