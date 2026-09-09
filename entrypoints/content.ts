@@ -1,5 +1,7 @@
-import type { DomNode, PlanAction, AuditLogEntry } from '@/types';
+import type { DomNode, PlanAction, AuditLogEntry, PolicyRecord } from '@/types';
 import { executePlan } from './executor';
+import { detectPii } from './pii-detect';
+import { getPolicy, resolvePolicyAction, DEFAULT_POLICY } from './policy';
 
 export function extractDom(): DomNode[] {
   const selector = 'input, button, a, select, textarea, [role], label, h1, h2, h3, p, canvas';
@@ -10,6 +12,11 @@ export function extractDom(): DomNode[] {
   const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
 
   for (const el of elements) {
+    // Ignore internal privacy overlays
+    if (el.closest('#nexus-page-privacy-container') || el.closest('#nexus-privacy-badge')) {
+      continue;
+    }
+
     const rect = el.getBoundingClientRect();
     // Skip elements with zero width or zero height (hidden elements)
     if (rect.width <= 0 || rect.height <= 0) {
@@ -17,7 +24,6 @@ export function extractDom(): DomNode[] {
     }
 
     // Skip elements outside the current viewport bounds
-    // (e.g. negative coordinates, accessibility skip links, or scrolled out of view)
     if (
       rect.bottom <= 0 ||
       rect.top >= viewportHeight ||
@@ -87,6 +93,11 @@ export function renderPagePrivacyMasks(
     container.remove();
   }
 
+  let badge = document.getElementById('nexus-privacy-badge');
+  if (badge) {
+    badge.remove();
+  }
+
   if (!masks || masks.length === 0) return;
 
   container = document.createElement('div');
@@ -134,6 +145,30 @@ export function renderPagePrivacyMasks(
   }
 
   document.body.appendChild(container);
+
+  // Render floating status badge in bottom-right corner
+  badge = document.createElement('div');
+  badge.id = 'nexus-privacy-badge';
+  badge.style.position = 'fixed';
+  badge.style.bottom = '16px';
+  badge.style.right = '16px';
+  badge.style.background = 'linear-gradient(135deg, #0f172a 0%, #1e293b 100%)';
+  badge.style.color = '#38bdf8';
+  badge.style.border = '1px solid #38bdf8';
+  badge.style.borderRadius = '20px';
+  badge.style.padding = '6px 14px';
+  badge.style.fontSize = '12px';
+  badge.style.fontWeight = 'bold';
+  badge.style.boxShadow = '0 4px 14px rgba(0,0,0,0.3)';
+  badge.style.zIndex = '2147483645';
+  badge.style.fontFamily = 'system-ui, -apple-system, sans-serif';
+  badge.style.display = 'flex';
+  badge.style.alignItems = 'center';
+  badge.style.gap = '6px';
+  badge.style.pointerEvents = 'auto';
+  badge.style.cursor = 'default';
+  badge.innerHTML = `<span>🛡️</span> <span>Privacy Guard Active: <strong>${masks.length} Field(s) Masked</strong></span>`;
+  document.body.appendChild(badge);
 }
 
 export function clearPagePrivacyMasks() {
@@ -141,19 +176,111 @@ export function clearPagePrivacyMasks() {
   if (container) {
     container.remove();
   }
+  const badge = document.getElementById('nexus-privacy-badge');
+  if (badge) {
+    badge.remove();
+  }
+}
+
+/**
+ * Proactively scans the webpage for sensitive PII and applies on-screen redaction masks directly.
+ */
+export async function autoScanAndMask() {
+  try {
+    const dom = extractDom();
+    if (!dom || dom.length === 0) return;
+
+    // Detect PII via client-side regex & heuristics
+    const classifications = detectPii(dom, []);
+    if (!classifications || classifications.length === 0) {
+      clearPagePrivacyMasks();
+      return;
+    }
+
+    const policy = await getPolicy();
+    const masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string }> = [];
+
+    for (const c of classifications) {
+      const action = resolvePolicyAction(policy, c.category);
+      if (action === 'MASK' || action === 'BLOCK' || action === 'ASK') {
+        masks.push({
+          bbox: c.bbox,
+          category: c.category,
+          action,
+        });
+      }
+    }
+
+    if (masks.length > 0) {
+      renderPagePrivacyMasks(masks);
+      console.log(`[Nexus Privacy Agent] 🛡️ Proactive Auto-Masking applied: ${masks.length} sensitive element(s) shielded from agent vision.`);
+    } else {
+      clearPagePrivacyMasks();
+    }
+  } catch (err) {
+    console.warn('[Nexus Privacy Agent] autoScanAndMask error:', err);
+  }
 }
 
 export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
-    console.log('[Nexus Privacy Agent] Content script initialized on:', window.location.href, 'ID:', chrome.runtime.id);
+    console.log('[Nexus Privacy Agent] Proactive Content script initialized on:', window.location.href);
     try {
       document.documentElement.dataset.nexusExtensionId = chrome.runtime.id;
     } catch {
       // ignore
     }
 
+    // 1. Proactive auto-scan when page loads
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        setTimeout(autoScanAndMask, 300);
+      });
+    } else {
+      setTimeout(autoScanAndMask, 300);
+    }
+    window.addEventListener('load', () => setTimeout(autoScanAndMask, 500));
+
+    // 2. Watch for dynamic form inputs or DOM additions (debounced)
+    let mutationTimer: any = null;
+    const observer = new MutationObserver((mutations) => {
+      let isOurSelf = false;
+      for (const m of mutations) {
+        if (
+          (m.target as HTMLElement)?.id === 'nexus-page-privacy-container' ||
+          (m.target as HTMLElement)?.id === 'nexus-privacy-badge'
+        ) {
+          isOurSelf = true;
+          break;
+        }
+      }
+      if (isOurSelf) return;
+
+      clearTimeout(mutationTimer);
+      mutationTimer = setTimeout(autoScanAndMask, 400);
+    });
+
+    try {
+      if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+      }
+    } catch {
+      // ignore
+    }
+
+    document.addEventListener('input', () => {
+      clearTimeout(mutationTimer);
+      mutationTimer = setTimeout(autoScanAndMask, 300);
+    });
+
+    // 3. Message handlers for extension popup and background worker
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message && message.type === 'AUTO_SCAN_PRIVACY') {
+        autoScanAndMask().then(() => sendResponse({ success: true }));
+        return true;
+      }
+
       if (message && message.type === 'GET_CONTEXT') {
         const dom = extractDom();
         console.log(`[Nexus Privacy Agent] ✅ Extracted ${dom.length} DOM elements from page:`, dom);
