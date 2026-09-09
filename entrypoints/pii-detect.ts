@@ -1,4 +1,4 @@
-import type { DomNode, VisualRegion, PiiClassification } from '@/types';
+﻿import type { DomNode, VisualRegion, PiiClassification } from '@/types';
 
 // Regex patterns for value matching
 const AADHAAR_REGEX = /\b\d{4}\s?\d{4}\s?\d{4}\b/;
@@ -65,7 +65,22 @@ export function detectPii(
     const rawText = region.extractedText.trim();
     if (!rawText || DOCUMENT_CHROME_REGEX.test(rawText)) return;
 
-    // A. Regex value detections (includes matchedText)
+    // A. Regex value detections
+    const apiKeyMatch = rawText.match(API_KEY_REGEX);
+    if (apiKeyMatch) {
+      classifications.push({
+        category: 'password',
+        source: 'visual',
+        bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
+        matchedText: apiKeyMatch[0],
+        confidenceInDetection: 0.99,
+        originalIndex: index,
+        originalItem: region,
+      });
+      visualClassified.add(index);
+      return;
+    }
+
     const aadhaarMatch = rawText.match(AADHAAR_REGEX);
     if (aadhaarMatch) {
       classifications.push({
@@ -96,6 +111,36 @@ export function detectPii(
       return;
     }
 
+    const ssnMatch = rawText.match(SSN_REGEX);
+    if (ssnMatch) {
+      classifications.push({
+        category: 'ssn',
+        source: 'visual',
+        bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
+        matchedText: ssnMatch[0],
+        confidenceInDetection: 0.98,
+        originalIndex: index,
+        originalItem: region,
+      });
+      visualClassified.add(index);
+      return;
+    }
+
+    const ccMatch = rawText.match(CREDIT_CARD_REGEX);
+    if (ccMatch) {
+      classifications.push({
+        category: 'credit_card',
+        source: 'visual',
+        bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
+        matchedText: ccMatch[0],
+        confidenceInDetection: 0.98,
+        originalIndex: index,
+        originalItem: region,
+      });
+      visualClassified.add(index);
+      return;
+    }
+
     const phoneMatch = rawText.match(PHONE_REGEX);
     if (phoneMatch) {
       classifications.push({
@@ -119,21 +164,6 @@ export function detectPii(
         bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
         matchedText: emailMatch[0],
         confidenceInDetection: 0.9,
-        originalIndex: index,
-        originalItem: region,
-      });
-      visualClassified.add(index);
-      return;
-    }
-
-    const apiKeyMatch = rawText.match(API_KEY_REGEX);
-    if (apiKeyMatch) {
-      classifications.push({
-        category: 'password',
-        source: 'visual',
-        bbox: { x: region.bbox.x, y: region.bbox.y, width: region.bbox.w, height: region.bbox.h },
-        matchedText: apiKeyMatch[0],
-        confidenceInDetection: 0.99,
         originalIndex: index,
         originalItem: region,
       });
@@ -220,24 +250,9 @@ export function detectPii(
   domNodes.forEach((node, nodeIdx) => {
     if (node.tag === 'canvas') return;
 
-    // Never mask action buttons, navigation links, or section headings as PII
-    const isActionOrHeading =
-      node.tag === 'button' ||
-      node.role === 'button' ||
-      node.tag === 'a' ||
-      node.tag === 'h1' ||
-      node.tag === 'h2' ||
-      node.tag === 'h3' ||
-      node.tag === 'h4' ||
-      node.tag === 'h5' ||
-      node.tag === 'h6' ||
-      node.tag === 'label';
-
     const isInputField = node.tag === 'input' || node.tag === 'textarea' || node.tag === 'select';
-
     const nodeText = (node.text || '').trim();
     const nodeVal = (node.attributes?.value || '').trim();
-    const combinedValueText = `${nodeVal || (isInputField ? '' : nodeText)}`.trim();
     const inputAttrs = `${node.attributes?.name || ''} ${node.attributes?.id || ''} ${
       node.attributes?.placeholder || ''
     } ${node.attributes?.['aria-label'] || ''} ${node.attributes?.autocomplete || ''}`.toLowerCase();
@@ -251,7 +266,15 @@ export function detectPii(
     };
 
     // 1. Password input type -> Immediate MASK
-    if (isInputField && (inputType === 'password' || inputAttrs.includes('password') || inputAttrs.includes('secret') || inputAttrs.includes('token') || inputAttrs.includes('api_key') || inputAttrs.includes('apikey'))) {
+    if (
+      isInputField &&
+      (inputType === 'password' ||
+        inputAttrs.includes('password') ||
+        inputAttrs.includes('secret') ||
+        inputAttrs.includes('token') ||
+        inputAttrs.includes('api_key') ||
+        inputAttrs.includes('apikey'))
+    ) {
       classifications.push({
         category: 'password',
         source: 'dom',
@@ -267,7 +290,6 @@ export function detectPii(
     // 2. Value Regex Detections (high-confidence pattern match on actual data)
     const textToCheck = isInputField ? (nodeVal || nodeText) : nodeText;
 
-<<<<<<< HEAD
     if (textToCheck) {
       const apiKeyMatch = textToCheck.match(API_KEY_REGEX);
       if (apiKeyMatch) {
@@ -281,146 +303,6 @@ export function detectPii(
           originalItem: node,
         });
         return;
-=======
-    const phoneMatch = combinedText.match(PHONE_REGEX);
-    if (phoneMatch) {
-      classifications.push({
-        category: 'phone',
-        source: 'dom',
-        bbox,
-        matchedText: phoneMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const emailMatch = combinedText.match(EMAIL_REGEX);
-    if (emailMatch) {
-      classifications.push({
-        category: 'email',
-        source: 'dom',
-        bbox,
-        matchedText: emailMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const amountMatch = combinedText.match(AMOUNT_REGEX);
-    if (amountMatch) {
-      classifications.push({
-        category: 'amount',
-        source: 'dom',
-        bbox,
-        matchedText: amountMatch[0],
-        confidenceInDetection: 0.95,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const ssnMatch = combinedText.match(SSN_REGEX);
-    if (ssnMatch) {
-      classifications.push({
-        category: 'ssn',
-        source: 'dom',
-        bbox,
-        matchedText: ssnMatch[0],
-        confidenceInDetection: 0.98,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    const ccMatch = combinedText.match(CREDIT_CARD_REGEX);
-    if (ccMatch) {
-      classifications.push({
-        category: 'credit_card',
-        source: 'dom',
-        bbox,
-        matchedText: ccMatch[0],
-        confidenceInDetection: 0.98,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    // B. Password input detection:
-    // A password is fundamentally a credential input field or explicit password label
-    const isInput = node.tag === 'input' || node.tag === 'textarea';
-    const isPasswordType = node.tag === 'input' && node.attributes?.type === 'password';
-    const isPasswordAttr =
-      isInput &&
-      /\b(password|passwd|pwd|passcode|secret[_\s-]?key|api[_\s-]?key)\b/i.test(combinedAttrs);
-    const isPasswordLabel =
-      node.tag === 'label' &&
-      /^\s*(?:enter\s+)?(?:password|passcode)\s*:?\s*$/i.test(combinedText);
-
-    if (isPasswordType || isPasswordAttr || isPasswordLabel) {
-      classifications.push({
-        category: 'password',
-        source: 'dom',
-        bbox,
-        confidenceInDetection: isPasswordType ? 1.0 : 0.9,
-        originalIndex: nodeIdx,
-        originalItem: node,
-      });
-      return;
-    }
-
-    // Interactive buttons, links (e.g. sidebar chat items), and headings are NOT passwords or form labels
-    const isInteractiveOrHeading =
-      node.tag === 'button' ||
-      node.tag === 'a' ||
-      node.tag === 'h1' ||
-      node.tag === 'h2' ||
-      node.tag === 'h3' ||
-      node.tag === 'h4';
-
-    // C. Label & Attribute-based classification for form inputs and explicit labels
-    if (isInput) {
-      // Check input attributes (placeholder, name, id, etc.)
-      for (const item of LABEL_PATTERNS) {
-        if (item.category === 'password') continue; // Handled above
-        if (item.regex.test(combinedAttrs)) {
-          classifications.push({
-            category: item.category,
-            source: 'dom',
-            bbox,
-            confidenceInDetection: 0.9,
-            originalIndex: nodeIdx,
-            originalItem: node,
-          });
-          return;
-        }
-      }
-    } else if (!isInteractiveOrHeading) {
-      // For non-interactive text: only check if it is formatted as an explicit form label
-      const isExplicitLabelFormat =
-        node.tag === 'label' || /:\s*$/.test(combinedText) || combinedText.length <= 25;
-      if (isExplicitLabelFormat) {
-        for (const item of LABEL_PATTERNS) {
-          if (item.category === 'password') continue; // Handled above
-          if (item.regex.test(combinedText)) {
-            classifications.push({
-              category: item.category,
-              source: 'dom',
-              bbox,
-              confidenceInDetection: 0.85,
-              originalIndex: nodeIdx,
-              originalItem: node,
-            });
-            return;
-          }
-        }
->>>>>>> 269857d863111dc4937309da436c10d27d93bc12
       }
 
       const aadhaarMatch = textToCheck.match(AADHAAR_REGEX);
