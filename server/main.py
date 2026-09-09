@@ -6,8 +6,15 @@ cross-verify against the DOM and audit log, and return safe action plans.
 """
 
 import os
+import sys
 import time
 import logging
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from typing import List, Dict, Any, Optional, Literal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -339,3 +346,14 @@ def plan_agent_actions(req: PlanRequest):
         blockedActions=blocked_actions,
         auditTrail=audit_trail,
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("================================================================================")
+    print("Starting Nexus Privacy Agent - Server Agent on http://127.0.0.1:8000")
+    print("Interactive Test Page: http://127.0.0.1:8000/demo")
+    print("Health Status: http://127.0.0.1:8000/health")
+    print("================================================================================")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+
