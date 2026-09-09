@@ -11,17 +11,17 @@ const CREDIT_CARD_REGEX = /\b(?:\d{4}[-\s]?){3}\d{4}\b/;
 
 // Label patterns for label-proximity classification
 const LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
-  { category: 'aadhaar', regex: /\b(aadhaar|adhaar|aadhar|uidai|abdhaar|aadha|adha)\b/i },
-  { category: 'pan', regex: /\b(pan|p\.a\.n|permanent\s*account)\b|^-?pan[:\s]/i },
-  { category: 'name', regex: /\b(name|full\s*name|holder\s*name|candidate\s*name)\b|^name[:\s]/i },
-  { category: 'address', regex: /\b(address|addr|adlines|residence|residing|street|location)\b|^address[:\s]/i },
-  { category: 'phone', regex: /\b(phone|mobile|tel|telephone|cell|contact\s*no)\b/i },
-  { category: 'email', regex: /\b(email|e-mail)\b/i },
-  { category: 'amount', regex: /\b(total|amount|subtotal|balance|price|cost|fee)\b/i },
-  { category: 'ssn', regex: /\b(ssn|social\s*security|tax\s*id)\b/i },
-  { category: 'credit_card', regex: /\b(card|credit|debit|cvv|cvc|expir|cc-number|cardnumber)\b/i },
-  { category: 'password', regex: /\b(password|pass|secret|token|api[_\s-]?key|auth|pin)\b/i },
-  { category: 'dob', regex: /\b(dob|birth|birthdate|date\s*of\s*birth)\b/i },
+  { category: 'aadhaar', regex: /\b(aadhaar|adhaar|aadhar|uidai)\b/i },
+  { category: 'pan', regex: /\b(pan\s*card|pan\s*no|p\.a\.n|permanent\s*account)\b|^-?pan[:\s]/i },
+  { category: 'name', regex: /\b(full\s*name|holder\s*name|candidate\s*name|first\s*name|last\s*name)\b|^name[:\s]/i },
+  { category: 'address', regex: /\b(street\s*address|residential\s*address|billing\s*address|shipping\s*address)\b|^address[:\s]/i },
+  { category: 'phone', regex: /\b(phone\s*number|mobile\s*number|telephone|contact\s*no)\b|^phone[:\s]/i },
+  { category: 'email', regex: /\b(email\s*address|e-mail\s*address)\b|^email[:\s]/i },
+  { category: 'amount', regex: /\b(total\s*amount|subtotal|amount\s*due|grand\s*total)\b|^total[:\s]/i },
+  { category: 'ssn', regex: /\b(ssn|social\s*security(?:\s*number)?|tax\s*id)\b/i },
+  { category: 'credit_card', regex: /\b(credit\s*card|debit\s*card|card\s*number|cvv|cvc|cardnumber)\b/i },
+  { category: 'password', regex: /\b(password|passcode|passwd)\b[:\s]?/i },
+  { category: 'dob', regex: /\b(dob|birthdate|date\s*of\s*birth)\b/i },
 ];
 
 /**
@@ -331,18 +331,74 @@ export function detectPii(
       return;
     }
 
-    // B. Label & Attribute-based classification
-    for (const item of LABEL_PATTERNS) {
-      if (item.regex.test(combinedAttrs) || item.regex.test(combinedText)) {
-        classifications.push({
-          category: item.category,
-          source: 'dom',
-          bbox,
-          confidenceInDetection: 0.9,
-          originalIndex: nodeIdx,
-          originalItem: node,
-        });
-        return;
+    // B. Password input detection:
+    // A password is fundamentally a credential input field or explicit password label
+    const isInput = node.tag === 'input' || node.tag === 'textarea';
+    const isPasswordType = node.tag === 'input' && node.attributes?.type === 'password';
+    const isPasswordAttr =
+      isInput &&
+      /\b(password|passwd|pwd|passcode|secret[_\s-]?key|api[_\s-]?key)\b/i.test(combinedAttrs);
+    const isPasswordLabel =
+      node.tag === 'label' &&
+      /^\s*(?:enter\s+)?(?:password|passcode)\s*:?\s*$/i.test(combinedText);
+
+    if (isPasswordType || isPasswordAttr || isPasswordLabel) {
+      classifications.push({
+        category: 'password',
+        source: 'dom',
+        bbox,
+        confidenceInDetection: isPasswordType ? 1.0 : 0.9,
+        originalIndex: nodeIdx,
+        originalItem: node,
+      });
+      return;
+    }
+
+    // Interactive buttons, links (e.g. sidebar chat items), and headings are NOT passwords or form labels
+    const isInteractiveOrHeading =
+      node.tag === 'button' ||
+      node.tag === 'a' ||
+      node.tag === 'h1' ||
+      node.tag === 'h2' ||
+      node.tag === 'h3' ||
+      node.tag === 'h4';
+
+    // C. Label & Attribute-based classification for form inputs and explicit labels
+    if (isInput) {
+      // Check input attributes (placeholder, name, id, etc.)
+      for (const item of LABEL_PATTERNS) {
+        if (item.category === 'password') continue; // Handled above
+        if (item.regex.test(combinedAttrs)) {
+          classifications.push({
+            category: item.category,
+            source: 'dom',
+            bbox,
+            confidenceInDetection: 0.9,
+            originalIndex: nodeIdx,
+            originalItem: node,
+          });
+          return;
+        }
+      }
+    } else if (!isInteractiveOrHeading) {
+      // For non-interactive text: only check if it is formatted as an explicit form label
+      const isExplicitLabelFormat =
+        node.tag === 'label' || /:\s*$/.test(combinedText) || combinedText.length <= 25;
+      if (isExplicitLabelFormat) {
+        for (const item of LABEL_PATTERNS) {
+          if (item.category === 'password') continue; // Handled above
+          if (item.regex.test(combinedText)) {
+            classifications.push({
+              category: item.category,
+              source: 'dom',
+              bbox,
+              confidenceInDetection: 0.85,
+              originalIndex: nodeIdx,
+              originalItem: node,
+            });
+            return;
+          }
+        }
       }
     }
   });

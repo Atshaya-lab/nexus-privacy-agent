@@ -1172,7 +1172,7 @@ export default function App() {
           <div className="action-section">
             <button
               className="capture-button"
-              onClick={handleCaptureContext}
+              onClick={() => handleCaptureContext()}
               disabled={loading || visionLoading || sanitizing}
               id="capture-context-btn"
             >

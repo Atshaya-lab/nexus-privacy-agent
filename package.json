@@ -15,6 +15,7 @@
     "test:live": "node test-live.mjs",
     "server:start": "uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload",
     "server:test": "python -m server.test_agent",
+    "services": "node run-services.mjs",
     "demo": "node run-demo.mjs",
     "postinstall": "wxt prepare"
   },
