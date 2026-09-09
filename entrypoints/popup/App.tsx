@@ -244,9 +244,10 @@ export default function App() {
       // 1. Locate the target webpage tab
       let targetTab: chrome.tabs.Tab | undefined;
 
-      if (overrideTabId) {
+      const numericTabId = typeof overrideTabId === 'number' && overrideTabId > 0 ? overrideTabId : undefined;
+      if (numericTabId) {
         try {
-          targetTab = await chrome.tabs.get(overrideTabId);
+          targetTab = await chrome.tabs.get(numericTabId);
         } catch {
           // ignore
         }
@@ -808,7 +809,7 @@ export default function App() {
           <div className="action-section" style={{ marginBottom: '8px' }}>
             <button
               className="capture-button"
-              onClick={handleCaptureContext}
+              onClick={() => handleCaptureContext()}
               disabled={loading || visionLoading || sanitizing || autoRunning}
               id="capture-context-btn"
             >

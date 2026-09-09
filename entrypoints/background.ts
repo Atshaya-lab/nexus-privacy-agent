@@ -28,17 +28,20 @@ export default defineBackground(() => {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message && message.type === 'CAPTURE_SCREEN') {
       try {
-        const targetWindowId = typeof message.windowId === 'number' ? message.windowId : undefined;
+        const targetWindowId = typeof message.windowId === 'number' && message.windowId > 0 ? message.windowId : undefined;
         chrome.tabs.captureVisibleTab(
           targetWindowId as any,
           { format: 'png' },
           (dataUrl) => {
-            if (chrome.runtime.lastError) {
-              const errMsg = chrome.runtime.lastError.message || 'Capture failed';
-              console.warn('[Nexus Privacy Agent] captureVisibleTab error:', errMsg);
-              sendResponse('');
+            if (chrome.runtime.lastError || !dataUrl) {
+              chrome.tabs.captureVisibleTab(
+                null as any,
+                { format: 'png' },
+                (fallbackUrl) => {
+                  sendResponse(fallbackUrl || '');
+                }
+              );
             } else {
-              console.log('[Nexus Privacy Agent] Viewport screenshot captured, size:', dataUrl ? dataUrl.length : 0);
               sendResponse(dataUrl || '');
             }
           }
