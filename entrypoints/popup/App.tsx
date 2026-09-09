@@ -18,6 +18,8 @@ import './App.css';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'agent' | 'gate' | 'settings'>('agent');
+  const [extensionActive, setExtensionActive] = useState<boolean>(true);
+  const [proactiveShield, setProactiveShield] = useState<boolean>(true);
   const [loading, setLoading] = useState(false);
   const [visionLoading, setVisionLoading] = useState(false);
   const [sanitizing, setSanitizing] = useState(false);
@@ -225,14 +227,80 @@ export default function App() {
     }
   };
 
-  // Load persisted policy, check server, and auto-capture context on mount
+  // Load persisted policy, power state, check server, and auto-capture context on mount
   useEffect(() => {
     getPolicy().then((p) => setPolicyState(p));
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.get(['nexus_extension_active', 'nexus_proactive_shield'], (res) => {
+        if (res && res.nexus_extension_active !== undefined) {
+          setExtensionActive(Boolean(res.nexus_extension_active));
+        }
+        if (res && res.nexus_proactive_shield !== undefined) {
+          setProactiveShield(Boolean(res.nexus_proactive_shield));
+        }
+      });
+    }
     checkServerHealth();
     handleCaptureContext();
     const interval = setInterval(checkServerHealth, 6000);
     return () => clearInterval(interval);
   }, []);
+
+  const handleToggleExtensionActive = async () => {
+    const nextState = !extensionActive;
+    setExtensionActive(nextState);
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      await chrome.storage.local.set({ nexus_extension_active: nextState });
+    }
+
+    try {
+      let targetTabId = capturedTabId;
+      if (!targetTabId) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = currentActive?.id || null;
+      }
+      if (targetTabId) {
+        await chrome.tabs.sendMessage(targetTabId, {
+          type: 'SET_SHIELD_ACTIVE',
+          active: nextState,
+        });
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!nextState) {
+      setPageMasksVisible(false);
+    } else {
+      handleCaptureContext();
+    }
+  };
+
+  const handleToggleProactiveShield = async () => {
+    const nextState = !proactiveShield;
+    setProactiveShield(nextState);
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      await chrome.storage.local.set({ nexus_proactive_shield: nextState });
+    }
+
+    try {
+      let targetTabId = capturedTabId;
+      if (!targetTabId) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = currentActive?.id || null;
+      }
+      if (targetTabId) {
+        if (!nextState) {
+          await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' });
+          setPageMasksVisible(false);
+        } else if (extensionActive) {
+          await chrome.tabs.sendMessage(targetTabId, { type: 'AUTO_SCAN_PRIVACY' });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   const handleCaptureContext = async (overrideTabId?: number | null) => {
     setLoading(true);
@@ -712,9 +780,43 @@ export default function App() {
   return (
     <div className="agent-container">
       <header className="agent-header">
-        <h1 className="agent-title">Nexus Privacy Agent</h1>
-        <p className="agent-subtitle">Phase 5: Visual Grounding Agent &amp; Autonomous Browser Execution</p>
+        <div className="header-top-row">
+          <div className="header-title-col">
+            <h1 className="agent-title">Nexus Privacy Agent</h1>
+            <p className="agent-subtitle">Phase 5: Visual Grounding &amp; Defense-in-Depth</p>
+          </div>
+          <div className="master-power-toggle">
+            <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
+              {extensionActive ? 'SHIELD ON' : 'SHIELD OFF'}
+            </span>
+            <button
+              type="button"
+              className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
+              onClick={handleToggleExtensionActive}
+              title={extensionActive ? 'Click to Pause Nexus Privacy Shield' : 'Click to Enable Nexus Privacy Shield'}
+              id="master-power-switch-btn"
+            >
+              <span className="switch-knob"></span>
+            </button>
+          </div>
+        </div>
       </header>
+
+      {!extensionActive && (
+        <div className="paused-alert-banner" id="paused-alert-banner">
+          <div className="paused-alert-text">
+            <strong>⏸️ Privacy Shield is Paused</strong>
+            <p>On-screen redaction badges and background scanning are disabled. Normal browsing is untouched.</p>
+          </div>
+          <button
+            type="button"
+            className="paused-enable-btn"
+            onClick={handleToggleExtensionActive}
+          >
+            ▶️ Turn ON
+          </button>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="tab-navigation">
@@ -1409,6 +1511,57 @@ export default function App() {
       {/* Tab 3: Settings */}
       {activeTab === 'settings' && (
         <div className="tab-content settings-tab" id="settings-tab-content">
+          {/* 🛡️ Master Extension Shield & Proactive Scanning Card */}
+          <div className="gpu-settings-card" style={{ marginBottom: '12px' }} id="extension-controls-card">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+              <strong style={{ fontSize: '0.84rem', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span>🛡️</span>
+                <span>Extension Shield &amp; Automation</span>
+              </strong>
+              <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
+                {extensionActive ? 'ACTIVE' : 'PAUSED'}
+              </span>
+            </div>
+            <p style={{ fontSize: '0.73rem', color: '#64748b', margin: '0 0 10px 0', lineHeight: 1.35 }}>
+              Enable or pause the extension whenever you want. You have 100% control over on-screen masks and proactive page scanning.
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {/* Row 1: Master Power */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div>
+                  <div style={{ fontSize: '0.80rem', fontWeight: 700, color: '#0f172a' }}>Master Extension Shield</div>
+                  <div style={{ fontSize: '0.70rem', color: '#64748b' }}>Turn extension on or pause it across all tabs</div>
+                </div>
+                <button
+                  type="button"
+                  className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
+                  onClick={handleToggleExtensionActive}
+                  id="settings-master-power-btn"
+                >
+                  <span className="switch-knob"></span>
+                </button>
+              </div>
+
+              {/* Row 2: Proactive Page Scanning */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
+                <div>
+                  <div style={{ fontSize: '0.80rem', fontWeight: 700, color: '#0f172a' }}>Proactive Page Scanner</div>
+                  <div style={{ fontSize: '0.70rem', color: '#64748b' }}>Automatically shield PII on page load vs on-demand only</div>
+                </div>
+                <button
+                  type="button"
+                  className={`master-toggle-switch ${proactiveShield ? 'on' : 'off'}`}
+                  onClick={handleToggleProactiveShield}
+                  disabled={!extensionActive}
+                  id="settings-proactive-shield-btn"
+                >
+                  <span className="switch-knob"></span>
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* ⚡ GPU Grounding & Server Configuration Card */}
           <div className="gpu-settings-card" id="gpu-settings-card">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
