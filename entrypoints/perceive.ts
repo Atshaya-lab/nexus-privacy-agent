@@ -230,12 +230,46 @@ export interface PerceiveResult {
 export async function perceiveScreenshot(screenshotDataUrl: string): Promise<PerceiveResult> {
   const totalStart = performance.now();
 
+  if (!screenshotDataUrl || !screenshotDataUrl.startsWith('data:image/')) {
+    return {
+      visualRegions: [],
+      metrics: {
+        totalDurationMs: 0,
+        candidateBandsDetected: 0,
+        ocrInferenceDurationMs: 0,
+        provider: 'wasm',
+        isWarm: false,
+      },
+    };
+  }
+
   // 1. Feature detect execution provider
   const provider = await detectExecutionProvider();
   console.log(`[Nexus Privacy Agent] Execution provider detected: ${provider.toUpperCase()}`);
 
-  // 2. Load model (or get cached singleton)
-  const { ocr, isWarm } = await getOcrPipeline(provider);
+  // 2. Load model (or get cached singleton) with 4s timeout fallback
+  let ocr: any;
+  let isWarm = false;
+  try {
+    const pipelineResult = await Promise.race([
+      getOcrPipeline(provider),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('OCR model load timeout')), 4000)),
+    ]);
+    ocr = pipelineResult.ocr;
+    isWarm = pipelineResult.isWarm;
+  } catch (ocrLoadErr) {
+    console.warn('[Nexus Privacy Agent] OCR pipeline unavailable or timed out, skipping visual OCR:', ocrLoadErr);
+    return {
+      visualRegions: [],
+      metrics: {
+        totalDurationMs: Math.round(performance.now() - totalStart),
+        candidateBandsDetected: 0,
+        ocrInferenceDurationMs: 0,
+        provider,
+        isWarm: false,
+      },
+    };
+  }
 
   // 3. Prepare image from dataUrl
   let rawImg: RawImage;
@@ -244,7 +278,16 @@ export async function perceiveScreenshot(screenshotDataUrl: string): Promise<Per
     rawImg = await RawImage.fromBlob(blob);
   } catch (err) {
     console.warn('[Nexus Privacy Agent] RawImage.fromBlob failed:', err);
-    throw err;
+    return {
+      visualRegions: [],
+      metrics: {
+        totalDurationMs: Math.round(performance.now() - totalStart),
+        candidateBandsDetected: 0,
+        ocrInferenceDurationMs: 0,
+        provider,
+        isWarm,
+      },
+    };
   }
 
   // 4. Run text region detection & OCR inference

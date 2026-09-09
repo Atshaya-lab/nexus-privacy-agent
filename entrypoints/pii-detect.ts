@@ -3,9 +3,11 @@ import type { DomNode, VisualRegion, PiiClassification } from '@/types';
 // Regex patterns for value matching
 const AADHAAR_REGEX = /\b\d{4}\s?\d{4}\s?\d{4}\b/;
 const PAN_REGEX = /\b[A-Z]{5}\d{4}[A-Z]\b/i;
-const PHONE_REGEX = /(\+91[\-\s]?)?[6-9]\d{9}/;
+const PHONE_REGEX = /(\+91[\-\s]?)?[6-9]\d{9}|\b\d{3}[-\s.]?\d{3}[-\s.]?\d{4}\b/;
 const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-const AMOUNT_REGEX = /(?:₹|rs\.?|inr|\$)\s?\d+(?:,\d+)*(?:\.\d+)?/i;
+const AMOUNT_REGEX = /(?:₹|rs\.?|inr|\$|€|£)\s?\d+(?:,\d+)*(?:\.\d+)?/i;
+const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/;
+const CREDIT_CARD_REGEX = /\b(?:\d{4}[-\s]?){3}\d{4}\b/;
 
 // Label patterns for label-proximity classification
 const LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
@@ -16,6 +18,10 @@ const LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
   { category: 'phone', regex: /\b(phone|mobile|tel|telephone|cell|contact\s*no)\b/i },
   { category: 'email', regex: /\b(email|e-mail)\b/i },
   { category: 'amount', regex: /\b(total|amount|subtotal|balance|price|cost|fee)\b/i },
+  { category: 'ssn', regex: /\b(ssn|social\s*security|tax\s*id)\b/i },
+  { category: 'credit_card', regex: /\b(card|credit|debit|cvv|cvc|expir|cc-number|cardnumber)\b/i },
+  { category: 'password', regex: /\b(password|pass|secret|token|api[_\s-]?key|auth|pin)\b/i },
+  { category: 'dob', regex: /\b(dob|birth|birthdate|date\s*of\s*birth)\b/i },
 ];
 
 /**
@@ -291,6 +297,34 @@ export function detectPii(
         bbox,
         matchedText: amountMatch[0],
         confidenceInDetection: 0.95,
+        originalIndex: nodeIdx,
+        originalItem: node,
+      });
+      return;
+    }
+
+    const ssnMatch = combinedText.match(SSN_REGEX);
+    if (ssnMatch) {
+      classifications.push({
+        category: 'ssn',
+        source: 'dom',
+        bbox,
+        matchedText: ssnMatch[0],
+        confidenceInDetection: 0.98,
+        originalIndex: nodeIdx,
+        originalItem: node,
+      });
+      return;
+    }
+
+    const ccMatch = combinedText.match(CREDIT_CARD_REGEX);
+    if (ccMatch) {
+      classifications.push({
+        category: 'credit_card',
+        source: 'dom',
+        bbox,
+        matchedText: ccMatch[0],
+        confidenceInDetection: 0.98,
         originalIndex: nodeIdx,
         originalItem: node,
       });

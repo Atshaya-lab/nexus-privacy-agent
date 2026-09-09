@@ -919,3 +919,193 @@
 .exec-step-status-icon {
   font-size: 0.85rem;
 }
+
+/* ⚡ Full Demo Flow Card */
+.full-demo-card {
+  background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+  border: 1.5px solid #6366f1;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.25);
+}
+
+.full-demo-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.full-demo-title {
+  font-size: 0.86rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #e0e7ff;
+}
+
+.full-demo-desc {
+  font-size: 0.73rem;
+  color: #c7d2fe;
+  line-height: 1.35;
+  margin-bottom: 10px;
+}
+
+.full-demo-btn {
+  background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%);
+  color: #ffffff;
+  border: 1px solid #a5b4fc;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.2s;
+  box-shadow: 0 2px 8px rgba(79, 70, 229, 0.4);
+}
+
+.full-demo-btn:hover:not(:disabled) {
+  background: linear-gradient(90deg, #4338ca 0%, #6d28d9 100%);
+  transform: translateY(-1px);
+}
+
+.full-demo-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.demo-progress-ticker {
+  margin-top: 8px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 0.72rem;
+  color: #a5f3fc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: monospace;
+}
+
+/* ⚙️ GPU Settings Card */
+.gpu-settings-card {
+  background: #f8fafc;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.gpu-mode-selector {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.gpu-mode-btn {
+  background: #ffffff;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 6px 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #475569;
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.15s;
+}
+
+.gpu-mode-btn.active {
+  background: #1e3a8a;
+  border-color: #1e3a8a;
+  color: #ffffff;
+}
+
+.gpu-input-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.gpu-endpoint-input {
+  flex: 1;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 0.74rem;
+  font-family: monospace;
+}
+
+.gpu-test-btn {
+  background: #0284c7;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.gpu-test-btn:hover:not(:disabled) {
+  background: #0369a1;
+}
+
+.gpu-test-btn:disabled {
+  background: #7dd3fc;
+  cursor: not-allowed;
+}
+
+.gpu-test-result {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 0.73rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gpu-test-result.success {
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  color: #166534;
+}
+
+.gpu-test-result.error {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+
+.fixture-launch-btn {
+  background: #f1f5f9;
+  border: 1px dashed #94a3b8;
+  color: #334155;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  width: 100%;
+  justify-content: center;
+}
+
+.fixture-launch-btn:hover {
+  background: #e2e8f0;
+  border-color: #64748b;
+}
