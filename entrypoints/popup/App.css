@@ -1516,3 +1516,305 @@
   overflow-y: auto;
 }
 
+/* Benchmark Metrics Button in Header */
+.benchmark-metrics-btn {
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.benchmark-metrics-btn:hover {
+  background: #bfdbfe;
+  color: #1e40af;
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.2);
+}
+
+/* Domain-Adaptive Sensitivity Bar */
+.domain-sensitivity-bar {
+  margin-top: 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.domain-sensitivity-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.domain-icon {
+  font-size: 1.1rem;
+}
+
+.domain-info-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.domain-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.domain-title-row strong {
+  font-size: 0.75rem;
+  color: #0f172a;
+}
+
+.domain-tier-tag {
+  font-size: 0.60rem;
+  font-weight: 800;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.domain-tier-tag.banking_financial { background: #fee2e2; color: #991b1b; }
+.domain-tier-tag.gov_identity { background: #fef3c7; color: #92400e; }
+.domain-tier-tag.standard_web { background: #dbeafe; color: #1e40af; }
+.domain-tier-tag.dev_sandbox { background: #f3e8ff; color: #6b21a8; }
+
+.domain-policy-desc {
+  display: block;
+  font-size: 0.66rem;
+  color: #64748b;
+  margin-top: 1px;
+}
+
+.domain-bench-link {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #2563eb;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.domain-bench-link:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+/* Benchmark Metrics Grid */
+.benchmark-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.metric-badge-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 6px;
+  text-align: center;
+}
+
+.metric-badge-card.highlight {
+  background: #f0fdf4;
+  border-color: #86efac;
+}
+
+.metric-pct {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: #15803d;
+  line-height: 1.1;
+  margin-bottom: 2px;
+}
+
+.metric-badge-card:not(.highlight) .metric-pct {
+  color: #0f172a;
+}
+
+.metric-title {
+  font-size: 0.62rem;
+  color: #475569;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+/* 2x2 Confusion Matrix Section */
+.confusion-matrix-section {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.confusion-title {
+  font-size: 0.76rem;
+  color: #0f172a;
+  margin-bottom: 8px;
+}
+
+.matrix-table-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr 1fr;
+  gap: 4px;
+}
+
+.matrix-header-cell {
+  font-size: 0.64rem;
+  font-weight: 700;
+  color: #475569;
+  text-align: center;
+  padding: 4px;
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+.matrix-row-label {
+  font-size: 0.64rem;
+  font-weight: 700;
+  color: #475569;
+  display: flex;
+  align-items: center;
+  padding: 4px;
+  background: #f8fafc;
+  border-radius: 4px;
+}
+
+.matrix-cell {
+  padding: 8px 6px;
+  border-radius: 4px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.64rem;
+}
+
+.matrix-cell strong {
+  font-size: 0.85rem;
+}
+
+.matrix-cell.tp {
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  color: #166534;
+}
+
+.matrix-cell.tn {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: #15803d;
+}
+
+.matrix-cell.fp {
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  color: #64748b;
+}
+
+.matrix-cell.fn {
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  color: #64748b;
+}
+
+/* 3-Signal Ensemble Architecture Card */
+.ensemble-signals-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.signal-flow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.signal-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.68rem;
+  color: #334155;
+}
+
+.signal-tag {
+  font-size: 0.60rem;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.signal-tag.sig-a { background: #fce7f3; color: #9d174d; }
+.signal-tag.sig-b { background: #dbeafe; color: #1e40af; }
+.signal-tag.sig-c { background: #fef3c7; color: #92400e; }
+
+.ensemble-tally-bar {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid #e2e8f0;
+  font-size: 0.70rem;
+  color: #15803d;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Domain Adapter Card */
+.domain-adapter-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.domain-sim-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.domain-sim-btn {
+  flex: 1;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 6px 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: center;
+}
+
+.domain-sim-btn:hover {
+  background: #e2e8f0;
+}
+
+.domain-sim-btn.active {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+
