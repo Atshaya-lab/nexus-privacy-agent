@@ -419,6 +419,11 @@ export default function App() {
     activeTask: string;
   } | null>(null);
 
+  // First-Time User Setup State
+  const [showFirstTimeModal, setShowFirstTimeModal] = useState<boolean>(false);
+  const [isProfileConfigured, setIsProfileConfigured] = useState<boolean>(true);
+  const [highlightProfileSettings, setHighlightProfileSettings] = useState<boolean>(false);
+
   // Accordion Sections State
   const [expandedSections, setExpandedSections] = useState<{
     basic: boolean;
@@ -1124,6 +1129,41 @@ export default function App() {
     }
   };
 
+  const handleGoToSettingsForFirstTime = () => {
+    setShowFirstTimeModal(false);
+    const FIRST_TIME_KEY = 'nexus_first_time_details_prompted';
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.set({ [FIRST_TIME_KEY]: true });
+    } else if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(FIRST_TIME_KEY, 'true');
+    }
+
+    setActiveTab('settings');
+    setExpandedSections({ basic: true, address: true, career: false });
+    setHighlightProfileSettings(true);
+
+    setTimeout(() => {
+      const card = document.getElementById('user-profile-settings-card');
+      if (card) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+      const nameInput = document.getElementById('profile-fullname-input');
+      if (nameInput) {
+        nameInput.focus();
+      }
+    }, 200);
+  };
+
+  const handleDismissFirstTimeModal = () => {
+    setShowFirstTimeModal(false);
+    const FIRST_TIME_KEY = 'nexus_first_time_details_prompted';
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.set({ [FIRST_TIME_KEY]: true });
+    } else if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.setItem(FIRST_TIME_KEY, 'true');
+    }
+  };
+
   const handleSaveProfile = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     setProfileSaving(true);
@@ -1144,7 +1184,18 @@ export default function App() {
       const success = await saveProfile(userProfile);
       if (success) {
         setProfileSaveSuccess(true);
-        setTimeout(() => setProfileSaveSuccess(false), 3500);
+        const hasConfig = Boolean(userProfile.fullName && userProfile.email);
+        setIsProfileConfigured(hasConfig);
+        const FIRST_TIME_KEY = 'nexus_first_time_details_prompted';
+        if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+          chrome.storage.local.set({ [FIRST_TIME_KEY]: true });
+        } else if (typeof window !== 'undefined' && window.localStorage) {
+          localStorage.setItem(FIRST_TIME_KEY, 'true');
+        }
+        setTimeout(() => {
+          setProfileSaveSuccess(false);
+          setHighlightProfileSettings(false);
+        }, 3500);
       }
     } catch (err) {
       console.error('[Nexus Profile] Failed to save profile:', err);
@@ -1157,8 +1208,15 @@ export default function App() {
     if (window.confirm('Are you sure you want to clear your saved profile details from this browser?')) {
       await clearProfile();
       setUserProfile({ ...DEFAULT_USER_PROFILE });
+      setIsProfileConfigured(false);
       setProfileErrors({});
       setProfileSaveSuccess(false);
+      const FIRST_TIME_KEY = 'nexus_first_time_details_prompted';
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        chrome.storage.local.remove([FIRST_TIME_KEY]);
+      } else if (typeof window !== 'undefined' && window.localStorage) {
+        localStorage.removeItem(FIRST_TIME_KEY);
+      }
     }
   };
 
@@ -1213,7 +1271,26 @@ export default function App() {
 
     // Load initial settings
     getPolicy().then((p) => setPolicyState(p));
-    getProfile().then((prof) => setUserProfile(prof));
+    getProfile().then((prof) => {
+      setUserProfile(prof);
+      const hasConfig = Boolean(prof.fullName && prof.email);
+      setIsProfileConfigured(hasConfig);
+
+      const FIRST_TIME_KEY = 'nexus_first_time_details_prompted';
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        chrome.storage.local.get([FIRST_TIME_KEY], (res) => {
+          const alreadyPrompted = Boolean(res?.[FIRST_TIME_KEY]);
+          if (!alreadyPrompted && !hasConfig) {
+            setShowFirstTimeModal(true);
+          }
+        });
+      } else if (typeof window !== 'undefined' && window.localStorage) {
+        const alreadyPrompted = Boolean(localStorage.getItem(FIRST_TIME_KEY));
+        if (!alreadyPrompted && !hasConfig) {
+          setShowFirstTimeModal(true);
+        }
+      }
+    });
 
     if (typeof chrome !== 'undefined' && chrome.tabs) {
       chrome.tabs.query({ active: true, lastFocusedWindow: true }, ([tab]) => {
@@ -1327,6 +1404,28 @@ export default function App() {
       {/* TAB 1: AGENT LOOP */}
       {activeTab === 'agent' && (
         <div className="agent-loop-content" id="agent-loop-content">
+          {!isProfileConfigured && (
+            <div className="first-time-setup-banner" id="first-time-setup-banner">
+              <div className="first-time-banner-left">
+                <span className="first-time-banner-icon">👤</span>
+                <div>
+                  <div className="first-time-banner-title">First-Time Setup Required</div>
+                  <div className="first-time-banner-desc">
+                    Fill your details in Settings so the agent can autofill forms accurately for you.
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="first-time-banner-btn"
+                onClick={handleGoToSettingsForFirstTime}
+                id="btn-goto-settings-banner"
+              >
+                Go to Settings ⚙️
+              </button>
+            </div>
+          )}
+
           {/* Section 1: RUN DEMO FLOW */}
           <div className="clean-section run-demo-section" id="run-demo-section">
             <div className="section-header-row">
@@ -1781,20 +1880,37 @@ export default function App() {
           </div>
 
           {/* User Vault / Personal Details Card */}
-          <div className="settings-group-card" id="user-profile-settings-card">
+          <div
+            className={`settings-group-card ${highlightProfileSettings ? 'highlight-profile-glow' : ''}`}
+            id="user-profile-settings-card"
+          >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
               <span className="settings-group-title" style={{ margin: 0 }}>👤 Personal Details (Local Vault)</span>
               <span style={{ fontSize: '10px', color: '#16a34a', background: '#dcfce7', padding: '2px 6px', borderRadius: '4px', fontWeight: 600 }}>
                 🔒 100% Local Only
               </span>
             </div>
+
+            {highlightProfileSettings && !isProfileConfigured && (
+              <div className="profile-first-time-highlight-notice">
+                ✨ <strong>First-Time Setup:</strong> Please enter your details below and click <strong>Save Details to Local Vault</strong> so the agent can autofill forms for you.
+              </div>
+            )}
+
             <p className="settings-group-desc">
               Your details are stored strictly in <code>chrome.storage.local</code> for autofill. They are <strong>never</strong> transmitted to any remote AI server.
             </p>
 
             {profileSaveSuccess && (
-              <div style={{ background: '#ecfdf5', border: '1px solid #86efac', color: '#166534', padding: '6px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 600, marginBottom: '8px' }}>
-                ✅ Details saved securely to your local browser vault!
+              <div style={{ background: '#ecfdf5', border: '1px solid #86efac', color: '#166534', padding: '8px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 600, marginBottom: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>✅ Details saved securely to your local browser vault!</span>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('agent')}
+                  style={{ background: '#16a34a', color: '#ffffff', border: 'none', borderRadius: '4px', padding: '3px 8px', fontSize: '10px', fontWeight: 700, cursor: 'pointer' }}
+                >
+                  Agent Loop →
+                </button>
               </div>
             )}
 
@@ -2196,6 +2312,74 @@ export default function App() {
                 onClick={() => setMissingPrompt(null)}
               >
                 Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* First-Time User Onboarding Modal */}
+      {showFirstTimeModal && (
+        <div className="missing-fields-modal-overlay" id="first-time-modal-overlay">
+          <div className="missing-fields-modal-card">
+            <div className="missing-fields-header">
+              <div className="missing-fields-icon-box" style={{ background: '#eff6ff', borderColor: '#93c5fd', color: '#2563eb' }}>
+                👋
+              </div>
+              <div>
+                <h3 className="missing-fields-title">Welcome to Nexus Privacy Agent</h3>
+                <p className="missing-fields-subtitle">First-time profile setup required for form filling</p>
+              </div>
+            </div>
+
+            <div className="first-time-modal-body">
+              <div className="first-time-intro-text">
+                To let your agent automatically fill web forms, job applications, and portals without using fake or dummy data, <strong>please fill in your details in Settings</strong>.
+              </div>
+
+              <div className="first-time-features-list">
+                <div className="first-time-feature-item">
+                  <span className="first-time-feature-icon">🔒</span>
+                  <div>
+                    <div className="first-time-feature-title">100% Local Privacy Vault</div>
+                    <div className="first-time-feature-desc">Stored strictly on your device. Never sent to any AI server or third party.</div>
+                  </div>
+                </div>
+
+                <div className="first-time-feature-item">
+                  <span className="first-time-feature-icon">⚡</span>
+                  <div>
+                    <div className="first-time-feature-title">Human-Like Autofill</div>
+                    <div className="first-time-feature-desc">Fills your real name, email, phone, and address into web forms seamlessly.</div>
+                  </div>
+                </div>
+
+                <div className="first-time-feature-item">
+                  <span className="first-time-feature-icon">🛡️</span>
+                  <div>
+                    <div className="first-time-feature-title">Complete User Control</div>
+                    <div className="first-time-feature-desc">You can review, update, or clear your saved details anytime in the Settings tab.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="missing-fields-footer">
+              <button
+                type="button"
+                className="btn-missing-save btn-first-time-primary"
+                onClick={handleGoToSettingsForFirstTime}
+                id="btn-first-time-goto-settings"
+              >
+                ⚙️ Fill Details in Settings →
+              </button>
+              <button
+                type="button"
+                className="btn-missing-skip"
+                onClick={handleDismissFirstTimeModal}
+                id="btn-first-time-skip"
+              >
+                Remind Me Later
               </button>
             </div>
           </div>
