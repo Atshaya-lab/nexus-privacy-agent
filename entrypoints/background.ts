@@ -121,7 +121,7 @@ export default defineBackground(() => {
         }
         saveSession(activeSession).then(() => {
           if (storageArea) {
-            storageArea.get(['nexus_popup_saved_state'], (res) => {
+            storageArea.get(['nexus_popup_saved_state', 'nexus_last_executed_action_state'], (res) => {
               if (res && res.nexus_popup_saved_state) {
                 const saved: any = res.nexus_popup_saved_state;
                 if (message.executionReport) {
@@ -133,6 +133,38 @@ export default defineBackground(() => {
                 saved.agentSession = activeSession;
                 storageArea.set({ nexus_popup_saved_state: saved }).catch(() => {});
               }
+
+              // Also persist into nexus_last_executed_action_state so it survives popup closure!
+              if (message.executionReport) {
+                const prev: any = res?.nexus_last_executed_action_state || {};
+                const report = message.executionReport;
+                const steps = (report.results || []).map((r: any, idx: number) => ({
+                  stepIndex: idx + 1,
+                  actionType: r.action?.action || 'action',
+                  description: r.action?.reasoning || `${r.action?.action?.toUpperCase() || 'Action'} on ${r.action?.targetSelector || 'element'}`,
+                  value: r.action?.value || undefined,
+                  targetSelector: r.action?.targetSelector || undefined,
+                  status: r.status,
+                  message: r.message,
+                }));
+                const updatedState = {
+                  ...prev,
+                  taskPrompt: prev.taskPrompt || activeSession?.taskPrompt || 'Autonomous Agent Task',
+                  url: prev.url || activeSession?.url,
+                  domain: prev.domain,
+                  plan: activeSession?.plan || prev.plan || null,
+                  executionReport: report,
+                  completedAt: Date.now(),
+                  success: report.success,
+                  totalSteps: report.totalSteps,
+                  executedSteps: report.executedSteps,
+                  steps,
+                  autoRunStep: report.success
+                    ? `Goal Completed: ${report.executedSteps}/${report.totalSteps} steps succeeded! ✅`
+                    : 'Some steps could not complete',
+                };
+                chrome.storage.local.set({ nexus_last_executed_action_state: updatedState }).catch(() => {});
+              }
             });
           }
           sendResponse({ success: true, session: activeSession });
@@ -140,6 +172,14 @@ export default defineBackground(() => {
       } else {
         sendResponse({ success: false, reason: 'No active session' });
       }
+      return true;
+    }
+
+    if (message.type === 'SET_EXTENSION_ACTIVE') {
+      if (!message.active && storageArea) {
+        chrome.storage.local.remove(['nexus_last_executed_action_state']).catch(() => {});
+      }
+      sendResponse({ success: true });
       return true;
     }
 

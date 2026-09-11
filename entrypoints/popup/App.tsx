@@ -27,6 +27,43 @@ import {
 import { isAutofillIntent, generateAutofillPlan, detectMissingFormFields } from '../agent/autofill';
 import './App.css';
 
+export const LAST_ACTION_STORAGE_KEY = 'nexus_last_executed_action_state';
+
+export interface ExecutedStepSummary {
+  stepIndex: number;
+  actionType: string;
+  description: string;
+  value?: string | null;
+  targetSelector?: string;
+  status: 'SUCCESS' | 'FAILED' | 'BLOCKED';
+  message?: string;
+}
+
+export interface LastExecutedActionState {
+  taskPrompt: string;
+  url?: string;
+  domain?: string;
+  pageTitle?: string;
+  plan: PlanResponse | null;
+  executionReport: ExecutionReport | null;
+  autoRunStep: string;
+  completedAt: number;
+  success: boolean;
+  totalSteps: number;
+  executedSteps: number;
+  steps: ExecutedStepSummary[];
+}
+
+function formatTimeAgo(timestamp: number): string {
+  if (!timestamp) return '';
+  const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+  if (diffSec < 15) return 'just now';
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 const DUMMY_FALLBACK_SCREENSHOT =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
@@ -405,6 +442,29 @@ export default function App() {
   const [showCustomPrompt, setShowCustomPrompt] = useState<boolean>(true);
   const [expandedImage, setExpandedImage] = useState<{ src: string; title: string; subtitle?: string } | null>(null);
 
+  // Persistent Last Action State (retained across popup closures until extension is toggled off)
+  const [lastActionState, setLastActionState] = useState<LastExecutedActionState | null>(null);
+
+  const persistLastActionState = (state: LastExecutedActionState) => {
+    setLastActionState(state);
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.set({ [LAST_ACTION_STORAGE_KEY]: state }).catch(() => {});
+    } else if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        localStorage.setItem(LAST_ACTION_STORAGE_KEY, JSON.stringify(state));
+      } catch {}
+    }
+  };
+
+  const clearLastActionState = () => {
+    setLastActionState(null);
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.remove([LAST_ACTION_STORAGE_KEY]).catch(() => {});
+    } else if (typeof window !== 'undefined' && window.localStorage) {
+      localStorage.removeItem(LAST_ACTION_STORAGE_KEY);
+    }
+  };
+
   // User Profile State (Stored strictly locally in chrome.storage.local)
   const [userProfile, setUserProfile] = useState<UserProfile>(DEFAULT_USER_PROFILE);
   const [profileSaving, setProfileSaving] = useState<boolean>(false);
@@ -527,6 +587,19 @@ export default function App() {
     try {
       if (typeof chrome !== 'undefined' && chrome.storage?.local) {
         await chrome.storage.local.set({ nexus_extension_active: nextState });
+        if (!nextState) {
+          await chrome.storage.local.remove([LAST_ACTION_STORAGE_KEY]);
+          setLastActionState(null);
+        }
+      } else if (typeof window !== 'undefined' && window.localStorage) {
+        localStorage.setItem('nexus_extension_active', String(nextState));
+        if (!nextState) {
+          localStorage.removeItem(LAST_ACTION_STORAGE_KEY);
+          setLastActionState(null);
+        }
+      }
+      if (typeof chrome !== 'undefined' && chrome.runtime) {
+        chrome.runtime.sendMessage({ type: 'SET_EXTENSION_ACTIVE', active: nextState }).catch(() => {});
       }
       let targetTabId = capturedTabId;
       if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
@@ -894,6 +967,32 @@ export default function App() {
       }
 
       setExecutionReport(report);
+      const steps: ExecutedStepSummary[] = (report.results || []).map((r, idx) => ({
+        stepIndex: idx + 1,
+        actionType: r.action?.action || 'action',
+        description: r.action?.reasoning || `${(r.action?.action || 'Action').toUpperCase()} on ${r.action?.targetSelector || 'element'}`,
+        value: r.action?.value,
+        targetSelector: r.action?.targetSelector,
+        status: r.status,
+        message: r.message,
+      }));
+
+      persistLastActionState({
+        taskPrompt: taskPrompt || 'Manual Plan Execution',
+        url: safeContext?.url,
+        domain: safeContext?.url ? new URL(safeContext.url).hostname : undefined,
+        pageTitle: (safeContext as any)?.title,
+        plan,
+        executionReport: report,
+        autoRunStep: report.success
+          ? `Plan Completed: ${report.executedSteps}/${report.totalSteps} steps succeeded! ✅`
+          : 'Some steps could not complete',
+        completedAt: Date.now(),
+        success: report.success,
+        totalSteps: report.totalSteps,
+        executedSteps: report.executedSteps,
+        steps,
+      });
     } catch (err: any) {
       console.error('Execution error:', err);
       setExecutionError(err?.message || 'Execution failed in browser tab');
@@ -1045,15 +1144,59 @@ export default function App() {
         }
 
         setExecutionReport(report);
-        if (report.success) {
-          setAutoRunStep(`4/4 Goal Completed: ${report.executedSteps}/${report.totalSteps} steps succeeded! ✅`);
-        } else {
-          const failedMsg = report.results.find((r) => r.status === 'FAILED')?.message;
-          setAutoRunStep(`4/4 Finished: ${failedMsg || 'Some steps could not complete'}`);
-        }
+        const steps: ExecutedStepSummary[] = (report.results || []).map((r, idx) => ({
+          stepIndex: idx + 1,
+          actionType: r.action?.action || 'action',
+          description: r.action?.reasoning || `${(r.action?.action || 'Action').toUpperCase()} on ${r.action?.targetSelector || 'element'}`,
+          value: r.action?.value,
+          targetSelector: r.action?.targetSelector,
+          status: r.status,
+          message: r.message,
+        }));
+
+        const finalStatus = report.success
+          ? `Goal Completed: ${report.executedSteps}/${report.totalSteps} steps succeeded! ✅`
+          : `Finished: ${report.results.find((r) => r.status === 'FAILED')?.message || 'Some steps could not complete'}`;
+        setAutoRunStep(`4/4 ${finalStatus}`);
+
+        persistLastActionState({
+          taskPrompt: activeTask,
+          url: currentSafe.url,
+          domain: currentSafe.url ? new URL(currentSafe.url).hostname : undefined,
+          pageTitle: (currentSafe as any)?.title,
+          plan: generatedPlan,
+          executionReport: report,
+          autoRunStep: finalStatus,
+          completedAt: Date.now(),
+          success: report.success,
+          totalSteps: report.totalSteps,
+          executedSteps: report.executedSteps,
+          steps,
+        });
       } else if (generatedPlan.blockedActions.length > 0) {
         const blockedName = generatedPlan.blockedActions[0]?.auditEntry?.category || 'Masked PII';
-        setAutoRunStep(`Privacy Gate Intercepted: Blocked access to ${blockedName.toUpperCase()}! 🛡️`);
+        const msg = `Privacy Gate Intercepted: Blocked access to ${blockedName.toUpperCase()}! 🛡️`;
+        setAutoRunStep(msg);
+        persistLastActionState({
+          taskPrompt: activeTask,
+          url: currentSafe.url,
+          domain: currentSafe.url ? new URL(currentSafe.url).hostname : undefined,
+          pageTitle: (currentSafe as any)?.title,
+          plan: generatedPlan,
+          executionReport: null,
+          autoRunStep: msg,
+          completedAt: Date.now(),
+          success: false,
+          totalSteps: generatedPlan.blockedActions.length,
+          executedSteps: 0,
+          steps: generatedPlan.blockedActions.map((b, idx) => ({
+            stepIndex: idx + 1,
+            actionType: 'block',
+            description: b.step,
+            status: 'BLOCKED',
+            message: b.reason,
+          })),
+        });
       } else {
         setAutoRunStep('No matching interactive elements found on this page for this goal.');
       }
@@ -1292,6 +1435,50 @@ export default function App() {
       }
     });
 
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      chrome.storage.local.get(['nexus_extension_active', LAST_ACTION_STORAGE_KEY], (res) => {
+        const isActive = res?.nexus_extension_active !== false;
+        setExtensionActive(isActive);
+        if (isActive && res?.[LAST_ACTION_STORAGE_KEY]) {
+          setLastActionState(res[LAST_ACTION_STORAGE_KEY] as LastExecutedActionState);
+        } else if (!isActive) {
+          chrome.storage.local.remove([LAST_ACTION_STORAGE_KEY]);
+          setLastActionState(null);
+        }
+      });
+    } else if (typeof window !== 'undefined' && window.localStorage) {
+      const activeStr = localStorage.getItem('nexus_extension_active');
+      const isActive = activeStr !== 'false';
+      setExtensionActive(isActive);
+      if (isActive) {
+        const saved = localStorage.getItem(LAST_ACTION_STORAGE_KEY);
+        if (saved) {
+          try {
+            setLastActionState(JSON.parse(saved) as LastExecutedActionState);
+          } catch {}
+        }
+      }
+    }
+
+    // Storage listener so popup stays synced if background worker finishes execution
+    const storageListener = (changes: { [key: string]: chrome.storage.StorageChange }, areaName: string) => {
+      if (areaName === 'local') {
+        if (changes.nexus_extension_active !== undefined) {
+          const active = changes.nexus_extension_active.newValue !== false;
+          setExtensionActive(active);
+          if (!active) {
+            setLastActionState(null);
+          }
+        }
+        if (changes[LAST_ACTION_STORAGE_KEY] !== undefined) {
+          setLastActionState((changes[LAST_ACTION_STORAGE_KEY].newValue as LastExecutedActionState) || null);
+        }
+      }
+    };
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener(storageListener);
+    }
+
     if (typeof chrome !== 'undefined' && chrome.tabs) {
       chrome.tabs.query({ active: true, lastFocusedWindow: true }, ([tab]) => {
         if (tab?.id && isEligibleWebpageTab(tab)) {
@@ -1309,7 +1496,12 @@ export default function App() {
       });
     }
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+        chrome.storage.onChanged.removeListener(storageListener);
+      }
+    };
   }, []);
 
   return (
@@ -1635,10 +1827,108 @@ export default function App() {
               </div>
             )}
 
-            {executionReport && (
-              <div style={{ marginTop: '8px', padding: '6px 8px', background: '#ecfdf5', borderRadius: '6px', fontSize: '11px', color: '#065f46', fontWeight: 600 }}>
-                ✅ Execution Succeeded: {executionReport.executedSteps}/{executionReport.totalSteps} steps completed
+            {/* Persistent Last Action Performed Card (retained until extension is turned off) */}
+            {lastActionState && extensionActive ? (
+              <div
+                className={`last-action-performed-card ${lastActionState.success ? '' : 'warning'}`}
+                id="last-action-performed-card"
+              >
+                <div className="action-performed-header">
+                  <div className="action-header-left">
+                    <span className="action-badge-pulse">{lastActionState.success ? '⚡' : '⚠️'}</span>
+                    <span className="action-header-title">Last Action Performed</span>
+                  </div>
+                  <div className="action-header-right">
+                    <span className={`action-status-pill ${lastActionState.success ? 'success' : 'warning'}`}>
+                      {lastActionState.success ? 'COMPLETED' : 'ATTENTION'}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-action-dismiss"
+                      onClick={clearLastActionState}
+                      title="Clear action history"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+
+                <div className="action-goal-banner">
+                  <span className="action-goal-label">Goal:</span>
+                  <span className="action-goal-text">{lastActionState.taskPrompt}</span>
+                </div>
+
+                <div className="action-meta-row">
+                  {lastActionState.domain && (
+                    <span className="action-meta-domain">🌐 {lastActionState.domain}</span>
+                  )}
+                  <span>⏱️ {formatTimeAgo(lastActionState.completedAt)}</span>
+                </div>
+
+                {lastActionState.steps && lastActionState.steps.length > 0 && (
+                  <div className="action-steps-timeline">
+                    <div className="action-steps-header">
+                      EXECUTED STEPS ({lastActionState.executedSteps}/{lastActionState.totalSteps}):
+                    </div>
+                    <div className="action-steps-list">
+                      {lastActionState.steps.map((st) => (
+                        <div
+                          key={st.stepIndex}
+                          className={`action-step-item ${st.status === 'SUCCESS' ? 'success' : 'failed'}`}
+                        >
+                          <span className="step-num">#{st.stepIndex}</span>
+                          <span className="step-icon">
+                            {st.actionType === 'type'
+                              ? '⌨️'
+                              : st.actionType === 'click'
+                              ? '🖱️'
+                              : st.actionType === 'select'
+                              ? '📋'
+                              : st.actionType === 'block'
+                              ? '🛡️'
+                              : '✓'}
+                          </span>
+                          <div className="step-details">
+                            <span className="step-desc" title={st.description}>
+                              {st.description}
+                            </span>
+                            {st.value && (
+                              <span className="step-val-tag" title={st.value}>
+                                "{st.value}"
+                              </span>
+                            )}
+                          </div>
+                          <span
+                            className={`step-status-tag ${
+                              st.status === 'SUCCESS' ? 'success' : 'failed'
+                            }`}
+                          >
+                            {st.status === 'SUCCESS' ? 'DONE' : 'FAILED'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="action-footer-status">
+                  <span className="action-status-summary">
+                    {lastActionState.autoRunStep ||
+                      (lastActionState.success
+                        ? '✅ Goal finished successfully'
+                        : '⚠️ Action finished with issues')}
+                  </span>
+                  <span className="action-persistence-note">
+                    📌 Retained across popup tabs until Privacy Shield is turned OFF
+                  </span>
+                </div>
               </div>
+            ) : (
+              executionReport && (
+                <div style={{ marginTop: '8px', padding: '6px 8px', background: '#ecfdf5', borderRadius: '6px', fontSize: '11px', color: '#065f46', fontWeight: 600 }}>
+                  ✅ Execution Succeeded: {executionReport.executedSteps}/{executionReport.totalSteps} steps completed
+                </div>
+              )
             )}
           </div>
 
