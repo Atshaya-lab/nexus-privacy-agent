@@ -8,20 +8,21 @@ const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
 const AMOUNT_REGEX = /(?:₹|rs\.?|inr|\$|€|£)\s?\d+(?:,\d+)*(?:\.\d+)?/i;
 const SSN_REGEX = /\b\d{3}-\d{2}-\d{4}\b/;
 const CREDIT_CARD_REGEX = /\b(?:\d{4}[-\s]?){3}\d{4}\b/;
+const DATE_REGEX = /\b(?:\d{1,2}[-\/\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\/\s]\d{2,4}|\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}|\d{4}[-\/\.]\d{1,2}[-\/\.]\d{1,2})\b/i;
 
 // Label patterns for label-proximity classification
 const LABEL_PATTERNS: Array<{ category: string; regex: RegExp }> = [
   { category: 'aadhaar', regex: /\b(aadhaar|adhaar|aadhar|uidai)\b/i },
   { category: 'pan', regex: /\b(pan\s*card|pan\s*no|p\.a\.n|permanent\s*account)\b|^-?pan[:\s]/i },
-  { category: 'name', regex: /\b(full\s*name|holder\s*name|candidate\s*name|first\s*name|last\s*name)\b|^name[:\s]/i },
-  { category: 'address', regex: /\b(street\s*address|residential\s*address|billing\s*address|shipping\s*address)\b|^address[:\s]/i },
-  { category: 'phone', regex: /\b(phone\s*number|mobile\s*number|telephone|contact\s*no)\b|^phone[:\s]/i },
-  { category: 'email', regex: /\b(email\s*address|e-mail\s*address)\b|^email[:\s]/i },
-  { category: 'amount', regex: /\b(total\s*amount|subtotal|amount\s*due|grand\s*total)\b|^total[:\s]/i },
+  { category: 'name', regex: /\b(full\s*name|holder\s*name|candidate\s*name|first\s*name|last\s*name|user\s*name|firstname|lastname|fullname|username)\b|\bname\b/i },
+  { category: 'address', regex: /\b(address|street|residential|billing|shipping|current\s*address|permanent\s*address|currentaddress|permanentaddress|useraddress)\b/i },
+  { category: 'phone', regex: /\b(phone\s*number|mobile\s*number|telephone|contact\s*no|mobile\s*no|cell\s*phone|mobile|usernumber|userphone|usercontact)\b|\bphone\b/i },
+  { category: 'email', regex: /\b(email\s*address|e-mail\s*address|e-mail|useremail)\b|\bemail\b/i },
+  { category: 'amount', regex: /\b(total\s*amount|subtotal|amount\s*due|grand\s*total|amount|price|cost|salary)\b|^total[:\s]/i },
   { category: 'ssn', regex: /\b(ssn|social\s*security(?:\s*number)?|tax\s*id)\b/i },
   { category: 'credit_card', regex: /\b(credit\s*card|debit\s*card|card\s*number|cvv|cvc|cardnumber)\b/i },
   { category: 'password', regex: /\b(password|passcode|passwd)\b[:\s]?/i },
-  { category: 'dob', regex: /\b(dob|birthdate|date\s*of\s*birth)\b/i },
+  { category: 'dob', regex: /\b(dob|birthdate|birthday|date\s*of\s*birth|dateofbirth|birthdateinput|dateofbirthinput)\b/i },
 ];
 
 /**
@@ -221,7 +222,9 @@ export function detectPii(
     const combinedText = `${node.text || ''} ${node.attributes?.value || ''}`.trim();
     const combinedAttrs = `${node.attributes?.name || ''} ${node.attributes?.id || ''} ${
       node.attributes?.placeholder || ''
-    } ${node.attributes?.type || ''}`.toLowerCase();
+    } ${node.attributes?.type || ''} ${node.attributes?.label || ''} ${
+      node.attributes?.['aria-label'] || ''
+    }`.toLowerCase();
 
     if (!combinedText && !combinedAttrs) return;
 
@@ -363,30 +366,63 @@ export function detectPii(
       node.tag === 'h3' ||
       node.tag === 'h4';
 
-    // C. Label & Attribute-based classification for form inputs and explicit labels
+    // C. Label & Attribute-based classification for form inputs and read-only displayed records
     if (isInput) {
-      // Check input attributes (placeholder, name, id, etc.)
-      for (const item of LABEL_PATTERNS) {
-        if (item.category === 'password') continue; // Handled above
-        if (item.regex.test(combinedAttrs)) {
-          classifications.push({
-            category: item.category,
-            source: 'dom',
-            bbox,
-            confidenceInDetection: 0.9,
-            originalIndex: nodeIdx,
-            originalItem: node,
-          });
-          return;
-        }
+      const val = (node.attributes?.value || node.text || '').trim();
+      const hasValue = val.length > 0;
+
+      // Date input type check
+      if (node.attributes?.type === 'date' && hasValue) {
+        const dateMatch = combinedText.match(DATE_REGEX);
+        classifications.push({
+          category: 'dob',
+          source: 'dom',
+          bbox,
+          matchedText: dateMatch ? dateMatch[0] : undefined,
+          confidenceInDetection: 0.95,
+          originalIndex: nodeIdx,
+          originalItem: node,
+        });
+        return;
       }
-    } else if (!isInteractiveOrHeading) {
-      // For non-interactive text: only check if it is formatted as an explicit form label
-      const isExplicitLabelFormat =
-        node.tag === 'label' || /:\s*$/.test(combinedText) || combinedText.length <= 25;
-      if (isExplicitLabelFormat) {
+
+      // Check input attributes and associated labels (only classify as sensitive PII if the field contains a value)
+      if (hasValue) {
         for (const item of LABEL_PATTERNS) {
           if (item.category === 'password') continue; // Handled above
+          if (item.regex.test(combinedAttrs)) {
+            let matchedText: string | undefined;
+            if (item.category === 'dob') {
+              const dateMatch = combinedText.match(DATE_REGEX);
+              if (dateMatch) matchedText = dateMatch[0];
+            } else if (item.category === 'phone') {
+              const phoneMatch = combinedText.match(PHONE_REGEX);
+              if (phoneMatch) matchedText = phoneMatch[0];
+            } else if (item.category === 'email') {
+              const emailMatch = combinedText.match(EMAIL_REGEX);
+              if (emailMatch) matchedText = emailMatch[0];
+            }
+            classifications.push({
+              category: item.category,
+              source: 'dom',
+              bbox,
+              matchedText: matchedText || val,
+              confidenceInDetection: 0.92,
+              originalIndex: nodeIdx,
+              originalItem: node,
+            });
+            return;
+          }
+        }
+      }
+    } else if (!isInteractiveOrHeading && node.tag !== 'label') {
+      // Never mask site UI form labels! Form labels are prompts for users, not user private data.
+      // For read-only profile summaries (e.g. "Name: Rahul Sharma", "DOB: 10/05/1995"):
+      // only classify if it actually contains a key-value format.
+      const hasValueAfterColon = /:\s*\S+/.test(combinedText);
+      if (hasValueAfterColon) {
+        for (const item of LABEL_PATTERNS) {
+          if (item.category === 'password') continue;
           if (item.regex.test(combinedText)) {
             classifications.push({
               category: item.category,
@@ -403,7 +439,99 @@ export function detectPii(
     }
   });
 
-  return classifications;
+  return deduplicateClassifications(classifications);
+}
+
+/**
+ * Calculates overlap ratio between two bounding boxes relative to the smaller box.
+ * Ratio >= 0.5 indicates significant spatial overlap / containment.
+ */
+export function computeOverlap(
+  boxA: { x: number; y: number; width: number; height: number },
+  boxB: { x: number; y: number; width: number; height: number }
+): number {
+  const x1 = Math.max(boxA.x, boxB.x);
+  const y1 = Math.max(boxA.y, boxB.y);
+  const x2 = Math.min(boxA.x + boxA.width, boxB.x + boxB.width);
+  const y2 = Math.min(boxA.y + boxA.height, boxB.y + boxB.height);
+
+  const interWidth = Math.max(0, x2 - x1);
+  const interHeight = Math.max(0, y2 - y1);
+  const interArea = interWidth * interHeight;
+
+  if (interArea <= 0) return 0;
+
+  const areaA = boxA.width * boxA.height;
+  const areaB = boxB.width * boxB.height;
+  const minArea = Math.min(areaA, areaB);
+
+  return interArea / minArea;
+}
+
+/**
+ * Deduplicates PII classifications across DOM and Visual perception streams:
+ * 1. Resolves dual-pipeline collisions: Drops visual OCR regions that overlap an already-classified DOM element (overlap >= 0.40).
+ * 2. Resolves DOM parent/container collisions: Drops redundant wrapper containers in favor of specific input/textarea controls (overlap >= 0.65).
+ * 3. Enforces unique tracking by DOM element ID.
+ */
+export function deduplicateClassifications(rawList: PiiClassification[]): PiiClassification[] {
+  if (!rawList || rawList.length <= 1) return rawList;
+
+  const domClassifications = rawList.filter((c) => c.source === 'dom');
+  const visualClassifications = rawList.filter((c) => c.source === 'visual');
+
+  // 1. Deduplicate DOM nodes
+  const keptDom: PiiClassification[] = [];
+  const seenDomIds = new Set<string>();
+
+  // Sort DOM nodes so specific form controls (input, textarea, select) have precedence over wrappers
+  domClassifications.sort((a, b) => {
+    const aTag = (a.originalItem as DomNode)?.tag?.toLowerCase() || '';
+    const bTag = (b.originalItem as DomNode)?.tag?.toLowerCase() || '';
+    const aIsControl = ['input', 'textarea', 'select'].includes(aTag) ? 1 : 0;
+    const bIsControl = ['input', 'textarea', 'select'].includes(bTag) ? 1 : 0;
+    if (aIsControl !== bIsControl) return bIsControl - aIsControl;
+    return (b.confidenceInDetection || 0) - (a.confidenceInDetection || 0);
+  });
+
+  for (const domItem of domClassifications) {
+    const domId = (domItem.originalItem as DomNode)?.attributes?.['data-nexus-dom-id'];
+    if (domId && seenDomIds.has(domId)) continue;
+
+    // Check if this DOM item significantly overlaps with any already kept DOM item
+    const isDuplicate = keptDom.some((kept) => {
+      const overlap = computeOverlap(domItem.bbox, kept.bbox);
+      return overlap >= 0.65;
+    });
+
+    if (!isDuplicate) {
+      if (domId) seenDomIds.add(domId);
+      keptDom.push(domItem);
+    }
+  }
+
+  // 2. Deduplicate Visual classifications against kept DOM nodes
+  const keptVisual: PiiClassification[] = [];
+  for (const visItem of visualClassifications) {
+    // If a DOM node already covers this visual region (> 40% overlap), drop visual duplicate
+    const overlapsDom = keptDom.some((domItem) => {
+      const overlap = computeOverlap(visItem.bbox, domItem.bbox);
+      return overlap >= 0.40;
+    });
+
+    if (overlapsDom) continue;
+
+    // Check against already kept visual items
+    const overlapsVisual = keptVisual.some((kept) => {
+      return computeOverlap(visItem.bbox, kept.bbox) >= 0.60;
+    });
+
+    if (!overlapsVisual) {
+      keptVisual.push(visItem);
+    }
+  }
+
+  return [...keptDom, ...keptVisual];
 }
 
 export default defineUnlistedScript(() => {});

@@ -17,6 +17,7 @@ stats.html
 stats-*.json
 .wxt
 .browser-test-data
+.browser-test-custom-goal
 web-ext.config.ts
 
 # Editor directories and files

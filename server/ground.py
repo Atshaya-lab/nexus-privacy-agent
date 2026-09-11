@@ -240,39 +240,48 @@ def _mock_grounding_engine(instruction: str, safe_context: Dict[str, Any]) -> Di
             node_type = (attrs.get("type") or "").lower()
 
             score = 0.0
+            kw_matches = 0
 
             # Match keywords against all textual attributes
             for kw in keywords:
                 if kw == text:
                     score += 5.0
+                    kw_matches += 1
                 elif kw in text:
                     score += 3.0
+                    kw_matches += 1
                 if kw == node_id or kw == node_name:
                     score += 4.0
+                    kw_matches += 1
                 elif kw in node_id or kw in node_name:
                     score += 2.5
+                    kw_matches += 1
                 if kw in placeholder or kw in aria_label:
                     score += 3.5
+                    kw_matches += 1
 
-            # Tag / role suitability bonus
-            if is_type_action:
-                if tag in ["input", "textarea"] or role in ["searchbox", "textbox"]:
-                    score += 2.5
-                elif tag in ["button", "a"]:
-                    score -= 2.0
-            elif is_click_action:
-                if tag in ["button", "a"] or role == "button" or node_type in ["submit", "button"]:
-                    score += 2.0
-                    # Special submit / verify handling
-                    if any(k in norm_instr for k in ["submit", "verify", "send"]):
-                        if "submit" in text or "verify" in text or "submit" in node_id or node_type == "submit":
-                            score += 4.0
+            # Tag / role suitability bonus: ONLY if keywords actually matched or if no specific keywords exist!
+            if kw_matches > 0 or len(keywords) == 0:
+                if is_type_action:
+                    if tag in ["input", "textarea"] or role in ["searchbox", "textbox"]:
+                        score += 2.5
+                    elif tag in ["button", "a"]:
+                        score -= 2.0
+                elif is_click_action:
+                    if tag in ["button", "a"] or role == "button" or node_type in ["submit", "button"]:
+                        score += 2.0
+                        # Special submit / verify handling
+                        if any(k in norm_instr for k in ["submit", "verify", "send"]):
+                            if "submit" in text or "verify" in text or "submit" in node_id or node_type == "submit":
+                                score += 4.0
 
             if score > best_score:
                 best_score = score
                 best_node = node
 
-        if best_node and best_score >= 2.0:
+        # Ensure minimum score threshold: if keywords exist, score must be >= 3.0 (i.e. at least one keyword matched!)
+        min_threshold = 3.0 if len(keywords) > 0 else 2.0
+        if best_node and best_score >= min_threshold:
             b = best_node.get("boundingBox", {})
             if b:
                 target_bbox = {
@@ -311,8 +320,14 @@ def _mock_grounding_engine(instruction: str, safe_context: Dict[str, Any]) -> Di
         f"Matched: {matched_label} | Jitter: ({jx:+0.1f}, {jy:+0.1f}) | "
         f"BBox: {final_bbox} | Confidence: {confidence}"
     )
-    print(log_msg)
-    logger.info(log_msg)
+    try:
+        print(log_msg)
+    except UnicodeEncodeError:
+        print(log_msg.encode('ascii', errors='replace').decode('ascii'))
+    try:
+        logger.info(log_msg)
+    except Exception:
+        pass
 
     return {
         "bbox": final_bbox,

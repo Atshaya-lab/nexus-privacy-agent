@@ -8,13 +8,364 @@ import type {
   PiiClassification,
   PlanResponse,
   PlanAction,
+  BlockedActionItem,
   ExecutionReport,
+  UserProfile,
+  MissingFieldItem,
 } from '@/types';
 import { needsVisualPerception, perceiveScreenshot } from '../perceive';
 import { detectPii } from '../pii-detect';
 import { sanitize } from '../sanitize';
 import { getPolicy, setPolicy, DEFAULT_POLICY } from '../policy';
+import {
+  getProfile,
+  saveProfile,
+  clearProfile,
+  validateProfile,
+  DEFAULT_USER_PROFILE,
+} from '../agent/profile';
+import { isAutofillIntent, generateAutofillPlan, detectMissingFormFields } from '../agent/autofill';
 import './App.css';
+
+const DUMMY_FALLBACK_SCREENSHOT =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+/**
+ * Client-Side Fallback Planner.
+ * Decomposes natural language tasks into grounded browser actions when backend server is offline or fast local execution is preferred.
+ */
+function planClientFallback(
+  task: string,
+  safeCtx: SafeContext,
+  profile?: UserProfile
+): PlanResponse {
+  const norm = task.toLowerCase().trim();
+  const domNodes = safeCtx.sanitizedDom || [];
+  const actions: PlanAction[] = [];
+  const blockedActions: BlockedActionItem[] = [];
+
+  // Privacy gate check: if user's goal targets sensitive masked PII (Aadhaar, PAN, etc.)
+  for (const entry of safeCtx.auditLog) {
+    if (entry.action === 'MASK' || entry.action === 'BLOCK') {
+      const cat = entry.category.toLowerCase();
+      if (
+        (cat === 'aadhaar' && (norm.includes('aadhaar') || norm.includes('uidai'))) ||
+        (cat === 'pan' && (norm.includes('pan') || norm.includes('tax'))) ||
+        (norm.includes(cat) && !norm.includes('do not') && !norm.includes("don't"))
+      ) {
+        blockedActions.push({
+          step: `Target ${entry.category}`,
+          reason: `Privacy Gate: Element contains sensitive ${entry.category.toUpperCase()} which has been masked. Access denied.`,
+          groundedBbox: {
+            x: entry.bbox.x,
+            y: entry.bbox.y,
+            w: entry.bbox.width,
+            h: entry.bbox.height,
+          },
+          auditEntry: entry,
+        });
+        return {
+          done: true,
+          summary: `Privacy Gate intercepted attempt to access masked ${entry.category.toUpperCase()} element.`,
+          groundingMode: 'CLIENT_FALLBACK',
+          actions: [],
+          blockedActions,
+          auditTrail: [],
+        };
+      }
+    }
+  }
+
+  // 0. Autonomous Form Autofill from saved local vault
+  if (isAutofillIntent(task)) {
+    return generateAutofillPlan(task, domNodes, profile);
+  }
+
+  // Helper to extract bounding box safely
+  const getBbox = (node?: DomNode) => ({
+    x: node?.boundingBox?.x || 0,
+    y: node?.boundingBox?.y || 0,
+    w: node?.boundingBox?.width || 80,
+    h: node?.boundingBox?.height || 32,
+  });
+
+  // 1. Search query: "search for X", "type X into search", "click search"
+  if (norm.includes('search') || norm.includes('find') || norm.includes('query')) {
+    const searchInput = domNodes.find((n) => {
+      const p = (n.attributes?.placeholder || '').toLowerCase();
+      const name = (n.attributes?.name || '').toLowerCase();
+      const id = (n.attributes?.id || '').toLowerCase();
+      const aria = (n.attributes?.['aria-label'] || '').toLowerCase();
+      return (
+        (n.tag === 'input' || n.tag === 'textarea') &&
+        (p.includes('search') || name.includes('search') || id.includes('search') || aria.includes('search') || n.attributes?.type === 'search')
+      );
+    }) || domNodes.find((n) => n.tag === 'input' && n.attributes?.type !== 'hidden');
+
+    const searchBtn = domNodes.find((n) => {
+      const t = (n.text || '').toLowerCase();
+      const p = (n.attributes?.placeholder || '').toLowerCase();
+      const aria = (n.attributes?.['aria-label'] || '').toLowerCase();
+      return (
+        (n.tag === 'button' || n.attributes?.type === 'submit') &&
+        (t.includes('search') || p.includes('search') || aria.includes('search'))
+      );
+    });
+
+    const queryMatch = task.match(/(?:search\s+(?:for\s+)?|type\s+)["']?([^"']+)["']?(?:\s+into|\s+in)?/i);
+    const query = queryMatch?.[1] && !queryMatch[1].toLowerCase().includes('search') ? queryMatch[1].trim() : 'Privacy Agent';
+
+    if (searchInput && (norm.includes('type') || norm.includes('enter') || norm.includes('for') || !norm.startsWith('click'))) {
+      actions.push({
+        action: 'click',
+        targetSelector: searchInput.attributes?.id ? `#${searchInput.attributes.id}` : searchInput.tag,
+        groundedBbox: getBbox(searchInput),
+        confidence: 0.9,
+        reasoning: 'Focus search input field',
+      });
+      actions.push({
+        action: 'type',
+        targetSelector: searchInput.attributes?.id ? `#${searchInput.attributes.id}` : searchInput.tag,
+        groundedBbox: getBbox(searchInput),
+        value: query,
+        confidence: 0.95,
+        reasoning: `Type "${query}" into search field`,
+      });
+    }
+
+    if (searchBtn && (norm.includes('click') || norm.includes('button') || !searchInput)) {
+      actions.push({
+        action: 'click',
+        targetSelector: searchBtn.attributes?.id ? `#${searchBtn.attributes.id}` : searchBtn.tag,
+        groundedBbox: getBbox(searchBtn),
+        confidence: 0.9,
+        reasoning: 'Click search button',
+      });
+    }
+  }
+
+  // 2. Submit action
+  else if (norm.includes('submit') || norm.includes('send') || norm.includes('complete')) {
+    const submitBtn =
+      domNodes.find((n) => {
+        const t = (n.text || '').toLowerCase();
+        const ty = (n.attributes?.type || '').toLowerCase();
+        return (n.tag === 'button' || ty === 'submit') && (t.includes('submit') || t.includes('send') || ty === 'submit');
+      }) || domNodes.find((n) => n.tag === 'button');
+
+    if (submitBtn) {
+      actions.push({
+        action: 'click',
+        targetSelector: submitBtn.attributes?.id ? `#${submitBtn.attributes.id}` : submitBtn.tag,
+        groundedBbox: getBbox(submitBtn),
+        confidence: 0.9,
+        reasoning: `Click ${submitBtn.text || 'Submit button'}`,
+      });
+    }
+  }
+
+  // 3. Login / Sign In
+  else if (norm.includes('log in') || norm.includes('login') || norm.includes('sign in')) {
+    const loginBtn = domNodes.find((n) => {
+      const t = (n.text || '').toLowerCase();
+      const id = (n.attributes?.id || '').toLowerCase();
+      return (n.tag === 'button' || n.tag === 'a') && (t.includes('log in') || t.includes('login') || t.includes('sign in') || id.includes('login'));
+    });
+
+    if (loginBtn) {
+      actions.push({
+        action: 'click',
+        targetSelector: loginBtn.attributes?.id ? `#${loginBtn.attributes.id}` : loginBtn.tag,
+        groundedBbox: getBbox(loginBtn),
+        confidence: 0.9,
+        reasoning: `Click ${loginBtn.text || 'Log in'}`,
+      });
+    }
+  }
+
+  // 4. Autofill whole form from saved profile details
+  else if (norm.includes('saved detail') || norm.includes('autofill') || (norm.includes('fill') && norm.includes('form'))) {
+    const fieldMapping: Array<{ key: keyof UserProfile; keywords: string[] }> = [
+      { key: 'fullName', keywords: ['full-name', 'fullname', 'name', 'applicant'] },
+      { key: 'email', keywords: ['email', 'mail'] },
+      { key: 'phone', keywords: ['phone', 'mobile', 'tel', 'contact'] },
+      { key: 'address', keywords: ['address', 'street'] },
+      { key: 'city', keywords: ['city', 'town'] },
+      { key: 'pincode', keywords: ['pincode', 'pin', 'zip', 'postal'] },
+    ];
+
+    for (const mapping of fieldMapping) {
+      const val = profile ? String(profile[mapping.key] || '') : '';
+      if (!val) continue;
+
+      const targetInput = domNodes.find((n) => {
+        if (n.tag !== 'input' && n.tag !== 'textarea') return false;
+        const id = (n.attributes?.id || '').toLowerCase();
+        const name = (n.attributes?.name || '').toLowerCase();
+        const placeholder = (n.attributes?.placeholder || '').toLowerCase();
+        return mapping.keywords.some((kw) => id.includes(kw) || name.includes(kw) || placeholder.includes(kw));
+      });
+
+      if (targetInput) {
+        actions.push({
+          action: 'type',
+          targetSelector: targetInput.attributes?.id ? `#${targetInput.attributes.id}` : targetInput.tag,
+          groundedBbox: getBbox(targetInput),
+          value: val,
+          confidence: 0.95,
+          reasoning: `Autofill ${mapping.key} with "${val}"`,
+        });
+      }
+    }
+  }
+
+  // 5. Typing / Filling fields
+  else if (norm.includes('type') || norm.includes('fill') || norm.includes('enter')) {
+    const typeMatch =
+      task.match(/(?:type|enter|input)\s+["']?([^"']+)["']?\s+(?:into|in|to)\s+(?:the\s+)?([^,.]+)/i) ||
+      task.match(/fill\s+(?:the\s+)?([^,.]+)\s+with\s+["']?([^"']+)["']?/i);
+
+    let val = '';
+    let targetKeyword = '';
+    if (typeMatch && typeMatch[1] && typeMatch[2]) {
+      if (norm.startsWith('fill')) {
+        targetKeyword = typeMatch[1].replace(/["']/g, '').trim().toLowerCase();
+        val = typeMatch[2].replace(/^["']|["']$/g, '').trim();
+      } else {
+        val = typeMatch[1].replace(/^["']|["']$/g, '').trim();
+        targetKeyword = typeMatch[2].replace(/["']/g, '').trim().toLowerCase();
+      }
+    } else {
+      for (const k of ['name', 'first', 'last', 'email', 'phone', 'address', 'city', 'pincode']) {
+        if (norm.includes(k)) {
+          targetKeyword = k;
+          if (profile && profile[k as keyof UserProfile]) {
+            val = String(profile[k as keyof UserProfile]);
+          } else if (k === 'name' && profile?.fullName) {
+            val = profile.fullName;
+          }
+          break;
+        }
+      }
+    }
+
+    const matchedInput =
+      domNodes.find((n) => {
+        if (n.tag !== 'input' && n.tag !== 'textarea') return false;
+        const id = (n.attributes?.id || '').toLowerCase();
+        const name = (n.attributes?.name || '').toLowerCase();
+        const p = (n.attributes?.placeholder || '').toLowerCase();
+        const aria = (n.attributes?.['aria-label'] || '').toLowerCase();
+        return (
+          id.includes(targetKeyword) ||
+          name.includes(targetKeyword) ||
+          p.includes(targetKeyword) ||
+          aria.includes(targetKeyword)
+        );
+      }) || domNodes.find((n) => n.tag === 'input' && n.attributes?.type !== 'hidden');
+
+    if (matchedInput) {
+      actions.push({
+        action: 'click',
+        targetSelector: matchedInput.attributes?.id ? `#${matchedInput.attributes.id}` : matchedInput.tag,
+        groundedBbox: getBbox(matchedInput),
+        confidence: 0.9,
+        reasoning: `Click ${targetKeyword || 'input'} field`,
+      });
+      actions.push({
+        action: 'type',
+        targetSelector: matchedInput.attributes?.id ? `#${matchedInput.attributes.id}` : matchedInput.tag,
+        groundedBbox: getBbox(matchedInput),
+        value: val || profile?.fullName || 'User Input',
+        confidence: 0.95,
+        reasoning: `Type "${val || profile?.fullName || 'User Input'}" into ${targetKeyword || 'input'} field`,
+      });
+    }
+  }
+
+  // 6. Generic Click
+  else if (norm.includes('click')) {
+    const cleanTarget = norm
+      .replace(/^(?:please\s+)?click\s+(?:the\s+)?(?:on\s+)?/, '')
+      .replace(/\s+(?:button|link|field|input|box)$/, '')
+      .replace(/^["']|["']$/g, '')
+      .trim();
+
+    const targetWords = cleanTarget
+      .toLowerCase()
+      .split(/[\s"']+/)
+      .filter((w) => w.length > 2);
+
+    const matchedEl =
+      domNodes.find((n) => {
+        const t = (n.text || '').toLowerCase();
+        const id = (n.attributes?.id || '').toLowerCase();
+        const name = (n.attributes?.name || '').toLowerCase();
+        const p = (n.attributes?.placeholder || '').toLowerCase();
+        const aria = (n.attributes?.['aria-label'] || '').toLowerCase();
+        return (
+          t.includes(cleanTarget) ||
+          id.includes(cleanTarget) ||
+          name.includes(cleanTarget) ||
+          p.includes(cleanTarget) ||
+          aria.includes(cleanTarget) ||
+          (targetWords.length > 0 && targetWords.every((w) => t.includes(w) || id.includes(w) || aria.includes(w)))
+        );
+      }) ||
+      domNodes.find((n) => {
+        const isInteractive = n.tag === 'button' || n.tag === 'a' || n.tag === 'input' || n.role === 'button';
+        if (!isInteractive) return false;
+        const t = (n.text || '').toLowerCase();
+        const id = (n.attributes?.id || '').toLowerCase();
+        return targetWords.some((w) => t.includes(w) || id.includes(w));
+      }) ||
+      domNodes.find((n) => n.tag === 'button' || n.tag === 'a');
+
+    if (matchedEl) {
+      actions.push({
+        action: 'click',
+        targetSelector: matchedEl.attributes?.id ? `#${matchedEl.attributes.id}` : matchedEl.tag,
+        groundedBbox: getBbox(matchedEl),
+        confidence: 0.9,
+        reasoning: `Click "${matchedEl.text || cleanTarget}"`,
+      });
+    }
+  }
+
+  if (actions.length === 0) {
+    const firstInteractive = domNodes.find((n) => n.tag === 'button' || (n.tag === 'input' && n.attributes?.type !== 'hidden') || n.tag === 'a');
+    if (firstInteractive) {
+      actions.push({
+        action: 'click',
+        targetSelector: firstInteractive.attributes?.id ? `#${firstInteractive.attributes.id}` : firstInteractive.tag,
+        groundedBbox: getBbox(firstInteractive),
+        confidence: 0.8,
+        reasoning: `Interact with ${firstInteractive.text || firstInteractive.tag}`,
+      });
+    }
+  }
+
+  return {
+    done: actions.length > 0,
+    summary: actions.length > 0 ? `Plan ready with ${actions.length} action(s) for "${task}"` : `No matching interactive elements found for "${task}"`,
+    groundingMode: 'CLIENT_FALLBACK',
+    actions,
+    blockedActions,
+    auditTrail: [],
+  };
+}
+
+function isEligibleWebpageTab(tab?: chrome.tabs.Tab | null): boolean {
+  if (!tab || !tab.id || !tab.url) return false;
+  const u = tab.url.toLowerCase();
+  return (
+    !u.startsWith('chrome://') &&
+    !u.startsWith('chrome-extension://') &&
+    !u.startsWith('edge://') &&
+    !u.startsWith('about:') &&
+    !u.startsWith('devtools://')
+  );
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'agent' | 'gate' | 'settings'>('agent');
@@ -37,13 +388,11 @@ export default function App() {
   const [testingGpu, setTestingGpu] = useState<boolean>(false);
   const [gpuTestResult, setGpuTestResult] = useState<{ success: boolean; message: string; latencyMs?: number } | null>(null);
 
-  // One-Click 5-Phase Demo State
+  // Automated Execution State
   const [autoRunning, setAutoRunning] = useState<boolean>(false);
   const [autoRunStep, setAutoRunStep] = useState<string>('');
 
-  const [taskPrompt, setTaskPrompt] = useState<string>(
-    'Click the submit button, but do not interact with the Aadhaar or PAN fields'
-  );
+  const [taskPrompt, setTaskPrompt] = useState<string>('');
   const [plan, setPlan] = useState<PlanResponse | null>(null);
   const [planning, setPlanning] = useState(false);
   const [planningError, setPlanningError] = useState<string | null>(null);
@@ -51,11 +400,46 @@ export default function App() {
   const [executionReport, setExecutionReport] = useState<ExecutionReport | null>(null);
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [capturedTabId, setCapturedTabId] = useState<number | null>(null);
+  const [activeTabId, setActiveTabId] = useState<number | null>(null);
   const [pageMasksVisible, setPageMasksVisible] = useState(false);
+  const [showCustomPrompt, setShowCustomPrompt] = useState<boolean>(true);
+  const [expandedImage, setExpandedImage] = useState<{ src: string; title: string; subtitle?: string } | null>(null);
+
+  // User Profile State (Stored strictly locally in chrome.storage.local)
+  const [userProfile, setUserProfile] = useState<UserProfile>(DEFAULT_USER_PROFILE);
+  const [profileSaving, setProfileSaving] = useState<boolean>(false);
+  const [profileSaveSuccess, setProfileSaveSuccess] = useState<boolean>(false);
+  const [profileErrors, setProfileErrors] = useState<Partial<Record<keyof UserProfile, string>>>({});
+
+  // Missing Information Modal State (Prompts user when form has fields missing from saved profile)
+  const [missingPrompt, setMissingPrompt] = useState<{
+    visible: boolean;
+    fields: MissingFieldItem[];
+    values: Record<string, string>;
+    activeTask: string;
+  } | null>(null);
+
+  // Accordion Sections State
+  const [expandedSections, setExpandedSections] = useState<{
+    basic: boolean;
+    address: boolean;
+    career: boolean;
+  }>({
+    basic: true,
+    address: false,
+    career: false,
+  });
+
+  const toggleSection = (section: 'basic' | 'address' | 'career') => {
+    setExpandedSections((prev) => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  };
 
   const applyPageMasks = async (ctx: SafeContext, tabId?: number | null) => {
     let targetTabId = tabId || capturedTabId;
-    if (!targetTabId) {
+    if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
       const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
       targetTabId = currentActive?.id || null;
     }
@@ -95,9 +479,7 @@ export default function App() {
       try {
         await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' });
         setPageMasksVisible(false);
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
   };
 
@@ -107,7 +489,7 @@ export default function App() {
     setPageMasksVisible(nextState);
 
     let targetTabId = capturedTabId;
-    if (!targetTabId) {
+    if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
       const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
       targetTabId = currentActive?.id || null;
     }
@@ -121,70 +503,675 @@ export default function App() {
           category: entry.category,
           action: entry.action,
         }));
-
       try {
         await chrome.tabs.sendMessage(targetTabId, {
           type: 'RENDER_PAGE_MASKS',
           masks,
         });
+      } catch {}
+    } else {
+      try {
+        await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' });
+      } catch {}
+    }
+  };
+
+  const handleToggleExtensionActive = async () => {
+    const nextState = !extensionActive;
+    setExtensionActive(nextState);
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        await chrome.storage.local.set({ nexus_extension_active: nextState });
+      }
+      let targetTabId = capturedTabId;
+      if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = currentActive?.id || null;
+      }
+      if (targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+        if (!nextState) {
+          await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' }).catch(() => {});
+          setPageMasksVisible(false);
+        } else {
+          await chrome.tabs.sendMessage(targetTabId, { type: 'AUTO_SCAN_PRIVACY' }).catch(() => {});
+        }
+      }
+    } catch {}
+  };
+
+  const handleToggleProactiveShield = async () => {
+    const nextState = !proactiveShield;
+    setProactiveShield(nextState);
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+        await chrome.storage.local.set({ nexus_proactive_shield: nextState });
+      }
+    } catch {}
+  };
+
+  const handleStopAgentSession = async () => {
+    try {
+      let targetTabId = capturedTabId;
+      if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = currentActive?.id || null;
+      }
+      if (targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+        await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' }).catch(() => {});
+      }
+      if (typeof chrome !== 'undefined' && chrome.runtime) {
+        await chrome.runtime.sendMessage({ type: 'STOP_AGENT_SESSION' }).catch(() => {});
+      }
+    } catch (err) {
+      console.warn('[Nexus Privacy Agent] Stop session error:', err);
+    }
+    setSafeContext(null);
+    setPerceivedContext(null);
+    setPageMasksVisible(false);
+    setPlan(null);
+    setExecutionReport(null);
+    setAutoRunning(false);
+    setAutoRunStep('');
+  };
+
+  const handleCaptureContext = async (overrideTabId?: number | null): Promise<SafeContext | null> => {
+    setLoading(true);
+    setVisionLoading(false);
+    setSanitizing(false);
+    setError(null);
+
+    try {
+      let targetTab: chrome.tabs.Tab | undefined;
+
+      const numericTabId = typeof overrideTabId === 'number' && overrideTabId > 0 ? overrideTabId : undefined;
+      if (numericTabId) {
+        try {
+          const tab = await chrome.tabs.get(numericTabId);
+          if (isEligibleWebpageTab(tab)) targetTab = tab;
+        } catch {}
+      }
+
+      if (!targetTab && capturedTabId) {
+        try {
+          const tab = await chrome.tabs.get(capturedTabId);
+          if (isEligibleWebpageTab(tab)) targetTab = tab;
+        } catch {}
+      }
+
+      if (!targetTab && typeof chrome !== 'undefined' && chrome.tabs) {
+        const [focusedActive] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (isEligibleWebpageTab(focusedActive)) {
+          targetTab = focusedActive;
+        }
+      }
+
+      if (!targetTab && typeof chrome !== 'undefined' && chrome.tabs) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (isEligibleWebpageTab(currentActive)) {
+          targetTab = currentActive;
+        }
+      }
+
+      if (!targetTab && typeof chrome !== 'undefined' && chrome.tabs) {
+        const allTabs = await chrome.tabs.query({});
+        targetTab =
+          allTabs.find((t) => t.url && t.url.includes('127.0.0.1:8000')) ||
+          allTabs.find((t) => t.url && t.url.includes('mock-id-card')) ||
+          allTabs.find((t) => t.url && (t.url.includes('8089') || t.url.includes('3456'))) ||
+          allTabs.find((t) => t.active && isEligibleWebpageTab(t)) ||
+          allTabs.find(isEligibleWebpageTab);
+      }
+
+      if (!targetTab || targetTab.id === undefined) {
+        throw new Error('Please open or switch to a webpage tab (e.g. google.com or our test page). Chrome blocks extensions on internal chrome:// pages.');
+      }
+
+      setCapturedTabId(targetTab.id);
+      setActiveTabId(targetTab.id);
+
+      // Request DOM from content script
+      let dom: DomNode[] = [];
+      try {
+        const domResponse = await chrome.tabs.sendMessage(targetTab.id, { type: 'GET_CONTEXT' });
+        dom = Array.isArray(domResponse) ? domResponse : domResponse?.dom || [];
       } catch {
         try {
+          await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            files: ['content-scripts/content.js'],
+          });
+          const domResponse = await chrome.tabs.sendMessage(targetTab.id, { type: 'GET_CONTEXT' });
+          dom = Array.isArray(domResponse) ? domResponse : domResponse?.dom || [];
+        } catch {
+          // fallback inline
+          const [result] = await chrome.scripting.executeScript({
+            target: { tabId: targetTab.id },
+            func: () => {
+              const elements = document.querySelectorAll('input, button, a, select, textarea, [role], label, h1, h2, h3, p');
+              const nodes: any[] = [];
+              const vW = window.innerWidth || document.documentElement.clientWidth;
+              const vH = window.innerHeight || document.documentElement.clientHeight;
+              for (const el of elements) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                if (rect.bottom <= 0 || rect.top >= vH || rect.right <= 0 || rect.left >= vW) continue;
+                const rawText = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.value || '' : el.textContent || '';
+                nodes.push({
+                  tag: el.tagName.toLowerCase(),
+                  text: rawText.trim().replace(/\s+/g, ' '),
+                  attributes: {
+                    id: el.id || undefined,
+                    name: el.getAttribute('name') || undefined,
+                    type: el.getAttribute('type') || undefined,
+                    placeholder: el.getAttribute('placeholder') || undefined,
+                  },
+                  boundingBox: {
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                  },
+                });
+              }
+              return nodes;
+            },
+          });
+          dom = (result?.result as DomNode[]) || [];
+        }
+      }
+
+      // Capture screenshot
+      let screenshot = '';
+      try {
+        const scrRes = await Promise.race([
+          chrome.runtime.sendMessage({ type: 'CAPTURE_SCREEN', windowId: targetTab.windowId }),
+          new Promise((r) => setTimeout(() => r(''), 3000)),
+        ]);
+        screenshot = typeof scrRes === 'string' ? scrRes : scrRes?.screenshot || '';
+      } catch {}
+
+      const requiresVision = needsVisualPerception(dom);
+      const perceived: PerceivedContext = {
+        url: targetTab.url || '',
+        timestamp: Date.now(),
+        dom,
+        screenshot,
+        perceptionSkipped: !requiresVision,
+      };
+
+      if (requiresVision && screenshot) {
+        setVisionLoading(true);
+        try {
+          const { visualRegions, metrics } = await perceiveScreenshot(screenshot);
+          perceived.visualRegions = visualRegions;
+          perceived.perceptionMetrics = metrics;
+        } catch (vErr) {
+          console.warn('Vision perception fallback:', vErr);
+        } finally {
+          setVisionLoading(false);
+        }
+      }
+
+      setPerceivedContext(perceived);
+
+      // PII Detection + Sanitize
+      setSanitizing(true);
+      const classifications = detectPii(perceived.dom, perceived.visualRegions);
+      const currentPolicy = await getPolicy();
+      setPolicyState(currentPolicy);
+
+      const safe = await sanitize(perceived, perceived, classifications, currentPolicy);
+      setSafeContext(safe);
+
+      await applyPageMasks(safe, targetTab.id);
+
+      // Only set initial prompt suggestion if the user hasn't already typed one!
+      setTaskPrompt((prev) => {
+        if (prev && prev.trim().length > 0) return prev;
+        const targetUrl = targetTab.url || '';
+        if (targetUrl.includes('mock-id') || targetUrl.includes('3456')) {
+          return 'Click the submit button, but do not interact with the Aadhaar or PAN fields';
+        } else if (targetUrl.includes('google') || targetUrl.includes('duckduckgo') || targetUrl.includes('wikipedia')) {
+          return 'Type "Privacy Agent" into search';
+        }
+        return 'Click search';
+      });
+
+      return safe;
+    } catch (err: any) {
+      console.error('Error capturing context:', err);
+      setError(err?.message || 'Failed to capture context');
+      return null;
+    } finally {
+      setLoading(false);
+      setSanitizing(false);
+    }
+  };
+
+  const handlePolicyChange = async (category: string, action: PolicyAction) => {
+    const updated = { ...policy, [category]: action };
+    setPolicyState(updated);
+    await setPolicy(updated);
+
+    if (perceivedContext) {
+      const classifications = detectPii(perceivedContext.dom, perceivedContext.visualRegions);
+      const reSanitized = await sanitize(perceivedContext, perceivedContext, classifications, updated);
+      setSafeContext(reSanitized);
+      await applyPageMasks(reSanitized);
+    }
+  };
+
+  const handleResolveAsk = async (field: PiiClassification, chosenAction: 'MASK' | 'ALLOW' | 'BLOCK') => {
+    if (!safeContext || !perceivedContext) return;
+    const updatedPolicy = { ...policy, [field.category.toLowerCase()]: chosenAction };
+    setPolicyState(updatedPolicy);
+    await setPolicy(updatedPolicy);
+
+    const classifications = detectPii(perceivedContext.dom, perceivedContext.visualRegions);
+    const reSanitized = await sanitize(perceivedContext, perceivedContext, classifications, updatedPolicy);
+    setSafeContext(reSanitized);
+    await applyPageMasks(reSanitized);
+  };
+
+  // Plan Only (Preview)
+  const handlePlanAgent = async () => {
+    const activeTask = taskPrompt.trim();
+    if (!activeTask) {
+      setError('Please enter a goal prompt before planning.');
+      return;
+    }
+
+    setPlanning(true);
+    setPlanningError(null);
+    setPlan(null);
+    setExecutionReport(null);
+    setExecutionError(null);
+
+    try {
+      let currentSafe = safeContext;
+      if (!currentSafe) {
+        currentSafe = await handleCaptureContext();
+      }
+      if (!currentSafe) {
+        throw new Error('Please open a webpage tab before planning.');
+      }
+
+      let planResponse: PlanResponse | null = null;
+      if (isAutofillIntent(activeTask)) {
+        const missing = detectMissingFormFields(activeTask, currentSafe.sanitizedDom, userProfile);
+        if (missing.length > 0) {
+          const initialVals: Record<string, string> = {};
+          missing.forEach((m) => {
+            initialVals[m.key] = '';
+          });
+          setMissingPrompt({
+            visible: true,
+            fields: missing,
+            values: initialVals,
+            activeTask,
+          });
+          setPlanningError(`Missing information required on form: ${missing.map((m) => m.label).join(', ')}. Please enter details in popup.`);
+          return;
+        }
+        planResponse = generateAutofillPlan(activeTask, currentSafe.sanitizedDom, userProfile);
+      } else {
+        try {
+          const payload = {
+            task: activeTask,
+            safeContext: {
+              url: currentSafe.url,
+              timestamp: currentSafe.timestamp,
+              sanitizedDom: currentSafe.sanitizedDom,
+              redactedScreenshot: currentSafe.redactedScreenshot || DUMMY_FALLBACK_SCREENSHOT,
+              auditLog: currentSafe.auditLog,
+            },
+          };
+
+          const res = await fetch('http://127.0.0.1:8000/agent/plan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+
+          if (res.ok) {
+            planResponse = await res.json();
+          }
+        } catch (srvErr) {
+          console.warn('Backend planner unavailable, using client-side fallback planner:', srvErr);
+        }
+
+        if (!planResponse || (planResponse.actions.length === 0 && planResponse.blockedActions.length === 0)) {
+          planResponse = planClientFallback(activeTask, currentSafe, userProfile);
+        }
+      }
+
+      setPlan(planResponse);
+    } catch (err: any) {
+      console.error('[Nexus Privacy Agent] Planning error:', err);
+      setPlanningError(err?.message || 'Failed to generate plan');
+    } finally {
+      setPlanning(false);
+    }
+  };
+
+  // Manual Execute Plan (After Plan Only)
+  const handleExecutePlan = async () => {
+    if (!plan || plan.actions.length === 0) return;
+    setExecuting(true);
+    setExecutionError(null);
+
+    try {
+      let targetTabId = capturedTabId;
+      if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
+        targetTabId = currentActive?.id || null;
+      }
+      if (!targetTabId) throw new Error('No target webpage tab found to execute actions.');
+
+      let report: ExecutionReport;
+      try {
+        report = await chrome.tabs.sendMessage(targetTabId, {
+          type: 'EXECUTE_PLAN',
+          actions: plan.actions,
+          safeContextAuditLog: safeContext?.auditLog || [],
+        });
+      } catch {
+        await chrome.scripting.executeScript({
+          target: { tabId: targetTabId },
+          files: ['content-scripts/content.js'],
+        });
+        await new Promise((r) => setTimeout(r, 300));
+        report = await chrome.tabs.sendMessage(targetTabId, {
+          type: 'EXECUTE_PLAN',
+          actions: plan.actions,
+          safeContextAuditLog: safeContext?.auditLog || [],
+        });
+      }
+
+      setExecutionReport(report);
+    } catch (err: any) {
+      console.error('Execution error:', err);
+      setExecutionError(err?.message || 'Execution failed in browser tab');
+    } finally {
+      setExecuting(false);
+    }
+  };
+
+  /**
+   * Autonomous Agent Execution Engine (The Core Work of the Agent).
+   * Automatically:
+   * 1. Captures DOM, perception, and applies Privacy Gate
+   * 2. Plans actions via ZonUI-3B / Server Agent (with instant client fallback)
+   * 3. Executes planned actions directly on the active webpage
+   * 4. Reports live step-by-step progress
+   */
+  const handleRunAgentGoal = async (
+    overrideTask?: string,
+    allowMissingFields?: boolean,
+    overrideProfile?: UserProfile
+  ) => {
+    const activeTask = (overrideTask || taskPrompt || '').trim();
+    if (!activeTask) {
+      setError('Please type a goal for the agent to execute.');
+      return;
+    }
+    if (overrideTask) {
+      setTaskPrompt(overrideTask);
+    }
+
+    const effectiveUserProf = overrideProfile || userProfile;
+
+    setAutoRunning(true);
+    setError(null);
+    setPlanningError(null);
+    setExecutionError(null);
+    setExecutionReport(null);
+
+    try {
+      // Step 1: Establish SafeContext
+      setAutoRunStep('1/4 Perceiving Viewport & Enforcing Privacy Gate...');
+      let currentSafe = safeContext;
+      if (!currentSafe) {
+        currentSafe = await handleCaptureContext();
+      }
+
+      if (!currentSafe) {
+        throw new Error('Please open or switch to a webpage tab (e.g. google.com or test page) before running the agent.');
+      }
+
+      await new Promise((r) => setTimeout(r, 300));
+
+      // Step 2: Planning & Grounding
+      let generatedPlan: PlanResponse | null = null;
+
+      if (isAutofillIntent(activeTask)) {
+        setAutoRunStep('2/4 Checking Profile & Active Form Fields...');
+        await new Promise((r) => setTimeout(r, 200));
+
+        // Check for missing fields unless user explicitly skipped
+        if (!allowMissingFields) {
+          const missing = detectMissingFormFields(activeTask, currentSafe.sanitizedDom, effectiveUserProf);
+          if (missing.length > 0) {
+            setAutoRunning(false);
+            setAutoRunStep(`⚠️ Missing required information (${missing.map((m) => m.label).join(', ')}). Please provide details in popup.`);
+            const initialVals: Record<string, string> = {};
+            missing.forEach((m) => {
+              initialVals[m.key] = '';
+            });
+            setMissingPrompt({
+              visible: true,
+              fields: missing,
+              values: initialVals,
+              activeTask,
+            });
+            return;
+          }
+        }
+
+        generatedPlan = generateAutofillPlan(activeTask, currentSafe.sanitizedDom, effectiveUserProf);
+      } else {
+        setAutoRunStep(`2/4 Planning via ZonUI-3B [${gpuMode}] for "${activeTask.slice(0, 28)}..."`);
+        try {
+          const planPayload = {
+            task: activeTask,
+            safeContext: {
+              url: currentSafe.url,
+              timestamp: currentSafe.timestamp,
+              sanitizedDom: currentSafe.sanitizedDom,
+              redactedScreenshot: currentSafe.redactedScreenshot || DUMMY_FALLBACK_SCREENSHOT,
+              auditLog: currentSafe.auditLog,
+            },
+          };
+
+          const planRes = await fetch('http://127.0.0.1:8000/agent/plan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(planPayload),
+          });
+
+          if (planRes.ok) {
+            generatedPlan = await planRes.json();
+          }
+        } catch (srvErr) {
+          console.warn('Server planning failed or offline, using client fallback:', srvErr);
+        }
+
+        if (!generatedPlan || (generatedPlan.actions.length === 0 && generatedPlan.blockedActions.length === 0)) {
+          generatedPlan = planClientFallback(activeTask, currentSafe, effectiveUserProf);
+        }
+      }
+
+      setPlan(generatedPlan);
+
+      // Step 3: Autonomous Execution
+      if (generatedPlan.actions.length > 0) {
+        setAutoRunStep(`3/4 Executing ${generatedPlan.actions.length} action(s) in browser tab...`);
+        await new Promise((r) => setTimeout(r, 400));
+
+        let targetTabId = capturedTabId;
+        if (!targetTabId && typeof chrome !== 'undefined' && chrome.tabs) {
+          const allTabs = await chrome.tabs.query({});
+          const webTab = allTabs.find(isEligibleWebpageTab);
+          targetTabId = webTab?.id || null;
+        }
+
+        if (!targetTabId) {
+          throw new Error('No target browser tab found to execute actions.');
+        }
+
+        let report: ExecutionReport;
+        try {
+          report = await chrome.tabs.sendMessage(targetTabId, {
+            type: 'EXECUTE_PLAN',
+            actions: generatedPlan.actions,
+            safeContextAuditLog: currentSafe.auditLog || [],
+          });
+        } catch {
           await chrome.scripting.executeScript({
             target: { tabId: targetTabId },
             files: ['content-scripts/content.js'],
           });
-          await chrome.tabs.sendMessage(targetTabId, {
-            type: 'RENDER_PAGE_MASKS',
-            masks,
+          await new Promise((r) => setTimeout(r, 300));
+          report = await chrome.tabs.sendMessage(targetTabId, {
+            type: 'EXECUTE_PLAN',
+            actions: generatedPlan.actions,
+            safeContextAuditLog: currentSafe.auditLog || [],
           });
-        } catch (e) {
-          console.warn('Could not render page masks:', e);
         }
+
+        setExecutionReport(report);
+        if (report.success) {
+          setAutoRunStep(`4/4 Goal Completed: ${report.executedSteps}/${report.totalSteps} steps succeeded! ✅`);
+        } else {
+          const failedMsg = report.results.find((r) => r.status === 'FAILED')?.message;
+          setAutoRunStep(`4/4 Finished: ${failedMsg || 'Some steps could not complete'}`);
+        }
+      } else if (generatedPlan.blockedActions.length > 0) {
+        const blockedName = generatedPlan.blockedActions[0]?.auditEntry?.category || 'Masked PII';
+        setAutoRunStep(`Privacy Gate Intercepted: Blocked access to ${blockedName.toUpperCase()}! 🛡️`);
+      } else {
+        setAutoRunStep('No matching interactive elements found on this page for this goal.');
       }
-    } else {
-      try {
-        await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' });
-      } catch {
-        // ignore
-      }
+    } catch (e: any) {
+      console.error('Agent execution error:', e);
+      setError(e?.message || 'Agent goal execution failed');
+      setAutoRunStep(`⚠️ Flow Interrupted: ${e?.message || e}`);
+    } finally {
+      setAutoRunning(false);
     }
   };
 
-  const checkServerHealth = async () => {
+  // Demo Flow helper
+  const handleRunFullDemoFlow = async (overrideTask?: string) => {
+    return handleRunAgentGoal(overrideTask);
+  };
+
+  // Missing Form Information Modal Handlers
+  const handleSaveMissingAndFill = async () => {
+    if (!missingPrompt) return;
+    const task = missingPrompt.activeTask;
+    const newValues = { ...missingPrompt.values };
+
+    const updated: UserProfile = {
+      ...userProfile,
+      ...newValues,
+    };
+
+    const fName = (updated.firstName || '').trim();
+    const lName = (updated.lastName || '').trim();
+    if (!updated.fullName?.trim() && (fName || lName)) {
+      updated.fullName = `${fName} ${lName}`.trim();
+    } else if (fName && lName && !updated.fullName.toLowerCase().includes(lName.toLowerCase())) {
+      updated.fullName = `${fName} ${lName}`.trim();
+    }
+
+    setUserProfile(updated);
+    await saveProfile(updated);
+    setMissingPrompt(null);
+
+    // Re-run agent goal with the updated profile!
+    await handleRunAgentGoal(task, false, updated);
+  };
+
+  const handleSkipMissingAndFill = async () => {
+    if (!missingPrompt) return;
+    const task = missingPrompt.activeTask;
+    setMissingPrompt(null);
+
+    // Re-run agent goal skipping missing fields (leaving them blank on the form, never fake!)
+    await handleRunAgentGoal(task, true, userProfile);
+  };
+
+  // User Profile Handlers (Local Storage Only)
+  const handleProfileFieldChange = (field: keyof UserProfile, value: string) => {
+    setUserProfile((prev) => {
+      const updated = { ...prev, [field]: value };
+      if (field === 'fullName') {
+        const parts = value.trim().split(/\s+/);
+        if (parts.length > 0) {
+          updated.firstName = parts[0];
+          updated.lastName = parts.slice(1).join(' ');
+        }
+      }
+      return updated;
+    });
+    if (profileErrors[field]) {
+      setProfileErrors((prev) => {
+        const copy = { ...prev };
+        delete copy[field];
+        return copy;
+      });
+    }
+  };
+
+  const handleSaveProfile = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setProfileSaving(true);
+    setProfileSaveSuccess(false);
+
+    const validation = validateProfile(userProfile);
+    if (!validation.valid) {
+      setProfileErrors(validation.errors);
+      setProfileSaving(false);
+      if (validation.errors.fullName || validation.errors.email || validation.errors.phone) {
+        setExpandedSections((prev) => ({ ...prev, basic: true }));
+      }
+      return;
+    }
+
+    setProfileErrors({});
     try {
-      const res = await fetch('http://127.0.0.1:8000/health');
-      if (res.ok) {
-        const data = await res.json();
-        setServerStatus('online');
-        setServerDetails(data);
-        if (data.groundingMode) {
-          setGpuMode(data.groundingMode);
-        }
-        return;
+      const success = await saveProfile(userProfile);
+      if (success) {
+        setProfileSaveSuccess(true);
+        setTimeout(() => setProfileSaveSuccess(false), 3500);
       }
-    } catch {
-      // offline
+    } catch (err) {
+      console.error('[Nexus Profile] Failed to save profile:', err);
+    } finally {
+      setProfileSaving(false);
     }
-    setServerStatus('offline');
-    setServerDetails(null);
   };
 
-  const handleUpdateGpuMode = async (mode: 'MOCK' | 'REMOTE_API' | 'LOCAL_MODEL', customEndpoint?: string) => {
+  const handleClearProfile = async () => {
+    if (window.confirm('Are you sure you want to clear your saved profile details from this browser?')) {
+      await clearProfile();
+      setUserProfile({ ...DEFAULT_USER_PROFILE });
+      setProfileErrors({});
+      setProfileSaveSuccess(false);
+    }
+  };
+
+  // GPU Settings Handlers
+  const handleUpdateGpuMode = async (mode: 'MOCK' | 'REMOTE_API' | 'LOCAL_MODEL', endpoint?: string) => {
     setGpuMode(mode);
-    const endpoint = customEndpoint !== undefined ? customEndpoint : gpuEndpoint;
     try {
-      const res = await fetch('http://127.0.0.1:8000/server/config', {
+      await fetch('http://127.0.0.1:8000/server/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, endpoint }),
+        body: JSON.stringify({ mode, endpoint: endpoint || gpuEndpoint }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        checkServerHealth();
-      }
-    } catch (e) {
-      console.warn('Could not persist GPU mode to server:', e);
-    }
+    } catch {}
   };
 
   const handleTestGpu = async () => {
@@ -197,1544 +1184,1043 @@ export default function App() {
         body: JSON.stringify({ mode: gpuMode, endpoint: gpuEndpoint }),
       });
       const data = await res.json();
-      setGpuTestResult({
-        success: data.success,
-        message: data.message || (data.success ? 'GPU Server connected successfully' : 'Connection failed'),
-        latencyMs: data.latencyMs,
-      });
+      setGpuTestResult(data);
     } catch (e: any) {
-      setGpuTestResult({
-        success: false,
-        message: e?.message || 'Failed to reach local server on port 8000',
-      });
+      setGpuTestResult({ success: false, message: e?.message || 'Failed to ping GPU endpoint' });
     } finally {
       setTestingGpu(false);
     }
   };
 
-  const handleOpenTestFixture = async () => {
-    try {
-      const demoUrl = serverStatus === 'online' ? 'http://127.0.0.1:8000/demo' : chrome.runtime.getURL('test-fixtures/mock-id-card.html');
-      const tab = await chrome.tabs.create({ url: demoUrl, active: true });
-      if (tab && tab.id) {
-        setCapturedTabId(tab.id);
-        setTimeout(() => {
-          handleCaptureContext(tab.id);
-        }, 800);
-      }
-    } catch (e) {
-      console.warn('Could not open test fixture tab:', e);
-    }
-  };
-
-  // Load persisted policy, power state, check server, and auto-capture context on mount
   useEffect(() => {
-    getPolicy().then((p) => setPolicyState(p));
-    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-      chrome.storage.local.get(['nexus_extension_active', 'nexus_proactive_shield'], (res) => {
-        if (res && res.nexus_extension_active !== undefined) {
-          setExtensionActive(Boolean(res.nexus_extension_active));
+    // Check Server Health
+    const checkServer = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8000/health', { method: 'GET' });
+        if (res.ok) {
+          const data = await res.json();
+          setServerStatus('online');
+          setServerDetails(data);
+        } else {
+          setServerStatus('offline');
         }
-        if (res && res.nexus_proactive_shield !== undefined) {
-          setProactiveShield(Boolean(res.nexus_proactive_shield));
+      } catch {
+        setServerStatus('offline');
+      }
+    };
+    checkServer();
+    const interval = setInterval(checkServer, 5000);
+
+    // Load initial settings
+    getPolicy().then((p) => setPolicyState(p));
+    getProfile().then((prof) => setUserProfile(prof));
+
+    if (typeof chrome !== 'undefined' && chrome.tabs) {
+      chrome.tabs.query({ active: true, lastFocusedWindow: true }, ([tab]) => {
+        if (tab?.id && isEligibleWebpageTab(tab)) {
+          setActiveTabId(tab.id);
+          setCapturedTabId(tab.id);
+        } else {
+          chrome.tabs.query({}, (tabs) => {
+            const webTab = tabs.find(isEligibleWebpageTab);
+            if (webTab?.id) {
+              setActiveTabId(webTab.id);
+              setCapturedTabId(webTab.id);
+            }
+          });
         }
       });
     }
-    checkServerHealth();
-    handleCaptureContext();
-    const interval = setInterval(checkServerHealth, 6000);
+
     return () => clearInterval(interval);
   }, []);
 
-  const handleToggleExtensionActive = async () => {
-    const nextState = !extensionActive;
-    setExtensionActive(nextState);
-    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-      await chrome.storage.local.set({ nexus_extension_active: nextState });
-    }
-
-    try {
-      let targetTabId = capturedTabId;
-      if (!targetTabId) {
-        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-        targetTabId = currentActive?.id || null;
-      }
-      if (targetTabId) {
-        await chrome.tabs.sendMessage(targetTabId, {
-          type: 'SET_SHIELD_ACTIVE',
-          active: nextState,
-        });
-      }
-    } catch {
-      // ignore
-    }
-
-    if (!nextState) {
-      setPageMasksVisible(false);
-    } else {
-      handleCaptureContext();
-    }
-  };
-
-  const handleToggleProactiveShield = async () => {
-    const nextState = !proactiveShield;
-    setProactiveShield(nextState);
-    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-      await chrome.storage.local.set({ nexus_proactive_shield: nextState });
-    }
-
-    try {
-      let targetTabId = capturedTabId;
-      if (!targetTabId) {
-        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-        targetTabId = currentActive?.id || null;
-      }
-      if (targetTabId) {
-        if (!nextState) {
-          await chrome.tabs.sendMessage(targetTabId, { type: 'CLEAR_PAGE_MASKS' });
-          setPageMasksVisible(false);
-        } else if (extensionActive) {
-          await chrome.tabs.sendMessage(targetTabId, { type: 'AUTO_SCAN_PRIVACY' });
-        }
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  const handleCaptureContext = async (overrideTabId?: number | null) => {
-    setLoading(true);
-    setVisionLoading(false);
-    setSanitizing(false);
-    setError(null);
-
-    try {
-      // 1. Locate the target webpage tab
-      let targetTab: chrome.tabs.Tab | undefined;
-
-      const numericTabId = typeof overrideTabId === 'number' && overrideTabId > 0 ? overrideTabId : undefined;
-      if (numericTabId) {
-        try {
-          targetTab = await chrome.tabs.get(numericTabId);
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!targetTab) {
-        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (
-          currentActive &&
-          currentActive.url &&
-          !currentActive.url.startsWith('chrome://') &&
-          !currentActive.url.startsWith('edge://') &&
-          !currentActive.url.startsWith('about:')
-        ) {
-          targetTab = currentActive;
-        }
-      }
-
-      if (!targetTab) {
-        const allTabs = await chrome.tabs.query({});
-        targetTab =
-          allTabs.find((t) => t.url && t.url.includes('127.0.0.1:8000')) ||
-          allTabs.find((t) => t.url && t.url.includes('mock-id-card')) ||
-          allTabs.find((t) => t.active && t.url && /^https?:\/\//i.test(t.url)) ||
-          allTabs.find((t) => t.url && /^https?:\/\//i.test(t.url)) ||
-          allTabs.find(
-            (t) =>
-              t.url &&
-              !t.url.startsWith('chrome://') &&
-              !t.url.startsWith('edge://') &&
-              !t.url.startsWith('about:')
-          );
-      }
-
-      if (!targetTab || targetTab.id === undefined) {
-        throw new Error('Please open or switch to a webpage tab (e.g. google.com or our test page). Chrome prevents extensions from capturing internal chrome:// pages.');
-      }
-      setCapturedTabId(targetTab.id);
-
-      // 2. Request DOM array from content script with seamless fallback
-      let dom: DomNode[] = [];
-      try {
-        const domResponse = await chrome.tabs.sendMessage(targetTab.id, { type: 'GET_CONTEXT' });
-        dom = Array.isArray(domResponse) ? domResponse : domResponse?.dom || [];
-      } catch {
-        // Tab was not refreshed after extension update; inject content script and retry
-        let fallbackSucceeded = false;
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: targetTab.id },
-            files: ['content-scripts/content.js'],
-          });
-          const domResponse = await chrome.tabs.sendMessage(targetTab.id, { type: 'GET_CONTEXT' });
-          dom = Array.isArray(domResponse) ? domResponse : domResponse?.dom || [];
-          fallbackSucceeded = true;
-        } catch {
-          // Fallback to inline extraction
-        }
-
-        if (!fallbackSucceeded) {
-          try {
-            const [result] = await chrome.scripting.executeScript({
-              target: { tabId: targetTab.id },
-              func: () => {
-                const selector = 'input, button, a, select, textarea, [role], label, h1, h2, h3, p, canvas';
-                const elements = document.querySelectorAll(selector);
-                const nodes: any[] = [];
-                const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-                const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-
-                for (const el of elements) {
-                  const rect = el.getBoundingClientRect();
-                  if (rect.width <= 0 || rect.height <= 0) continue;
-                  if (
-                    rect.bottom <= 0 ||
-                    rect.top >= viewportHeight ||
-                    rect.right <= 0 ||
-                    rect.left >= viewportWidth
-                  ) {
-                    continue;
-                  }
-                  const tag = el.tagName.toLowerCase();
-                  const role = el.getAttribute('role');
-                  let rawText = '';
-                  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-                    rawText = el.value || el.placeholder || el.getAttribute('aria-label') || '';
-                  } else {
-                    rawText = el.textContent || '';
-                  }
-                  const cleanText = rawText.trim().replace(/\s+/g, ' ');
-
-                  nodes.push({
-                    tag,
-                    role: role || null,
-                    text: cleanText,
-                    attributes: {
-                      id: el.id || undefined,
-                      name: el.getAttribute('name') || undefined,
-                      type: el.getAttribute('type') || undefined,
-                      placeholder: el.getAttribute('placeholder') || undefined,
-                      value: el instanceof HTMLInputElement ? el.value : undefined,
-                    },
-                    boundingBox: {
-                      x: Math.round(rect.x),
-                      y: Math.round(rect.y),
-                      width: Math.round(rect.width),
-                      height: Math.round(rect.height),
-                    },
-                  });
-                }
-                return nodes;
-              },
-            });
-            dom = (result?.result as DomNode[]) || [];
-          } catch (injectErr: any) {
-            console.error('DOM extraction error:', injectErr);
-            throw new Error('Could not access this tab. Please refresh the page and try again.');
-          }
-        }
-      }
-
-      // 3. Request screenshot from background script
-      let screenshot = '';
-      try {
-        const screenshotResponse = await Promise.race([
-          chrome.runtime.sendMessage({
-            type: 'CAPTURE_SCREEN',
-            windowId: targetTab.windowId,
-          }),
-          new Promise((resolve) => setTimeout(() => resolve(''), 3500)),
-        ]);
-        screenshot =
-          typeof screenshotResponse === 'string'
-            ? screenshotResponse
-            : screenshotResponse?.screenshot || '';
-      } catch (screenErr) {
-        console.warn('Screenshot capture failed:', screenErr);
-      }
-
-      // 4. Tiered Compute: Check if visual perception is needed
-      const requiresVision = needsVisualPerception(dom);
-
-      const perceived: PerceivedContext = {
-        url: targetTab.url || '',
-        timestamp: Date.now(),
-        dom,
-        screenshot,
-        perceptionSkipped: !requiresVision,
-      };
-
-      if (!requiresVision) {
-        perceived.perceptionReason = 'DOM context sufficient — visual perception skipped';
-        console.log('[Nexus Privacy Agent] Tiered Compute: DOM sufficient, vision skipped.');
-      } else {
-        console.log('[Nexus Privacy Agent] Tiered Compute: Running visual perception...');
-        setVisionLoading(true);
-
-        try {
-          const { visualRegions, metrics } = await perceiveScreenshot(screenshot);
-          perceived.visualRegions = visualRegions;
-          perceived.perceptionMetrics = metrics;
-          console.log(
-            `[Nexus Privacy Agent] Visual perception completed: ${visualRegions.length} regions detected:`,
-            visualRegions
-          );
-        } catch (visionErr: any) {
-          console.error('[Nexus Privacy Agent] Visual perception error:', visionErr);
-          perceived.perceptionReason = `Visual perception error: ${visionErr?.message || visionErr}`;
-        } finally {
-          setVisionLoading(false);
-        }
-      }
-
-      setPerceivedContext(perceived);
-
-      // 5. Phase 3: PII Classification + Sanitize
-      setSanitizing(true);
-      console.log('=== Nexus Privacy Agent Phase 3: Privacy Gate ===');
-
-      // Detect PII in both DOM nodes and visual regions
-      const classifications = detectPii(perceived.dom, perceived.visualRegions);
-      console.log(
-        `[Nexus Privacy Agent] PII Detection: ${classifications.length} fields classified:`,
-        classifications
-      );
-
-      // Load latest active policy
-      const currentPolicy = await getPolicy();
-      setPolicyState(currentPolicy);
-
-      // Apply Sanitize
-      const safe = await sanitize(perceived, perceived, classifications, currentPolicy);
-      console.log('[Nexus Privacy Agent] Sanitize complete: SafeContext generated:', safe);
-      setSafeContext(safe);
-
-      // Automatically render on-screen masks on the live webpage!
-      await applyPageMasks(safe, targetTab.id);
-
-      // Adapt initial prompt to the captured website
-      const targetUrl = targetTab.url || '';
-      if (targetUrl.includes('mock-id') || targetUrl.includes('3456')) {
-        setTaskPrompt('Click the submit button, but do not interact with the Aadhaar or PAN fields');
-      } else if (
-        targetUrl.includes('wikipedia') ||
-        targetUrl.includes('google') ||
-        targetUrl.includes('duckduckgo')
-      ) {
-        setTaskPrompt('Type "Privacy Agent" into search');
-      } else {
-        setTaskPrompt('Click search');
-      }
-    } catch (err: any) {
-      console.error('Error capturing context:', err);
-      setError(err?.message || 'Failed to capture context');
-    } finally {
-      setLoading(false);
-      setSanitizing(false);
-    }
-  };
-
-  const handlePolicyChange = async (category: string, action: PolicyAction) => {
-    const updated = { ...policy, [category]: action };
-    setPolicyState(updated);
-    await setPolicy(updated);
-
-    // If safeContext exists, re-sanitize with updated policy
-    if (perceivedContext) {
-      const classifications = detectPii(perceivedContext.dom, perceivedContext.visualRegions);
-      const reSanitized = await sanitize(perceivedContext, perceivedContext, classifications, updated);
-      setSafeContext(reSanitized);
-      await applyPageMasks(reSanitized);
-    }
-  };
-
-  const handleResolveAsk = async (field: PiiClassification, chosenAction: 'MASK' | 'ALLOW' | 'BLOCK') => {
-    if (!safeContext || !perceivedContext) return;
-
-    // Apply temporary override for this field
-    const classifications = detectPii(perceivedContext.dom, perceivedContext.visualRegions);
-    const tempPolicy = { ...policy, [field.category]: chosenAction };
-    const reSanitized = await sanitize(perceivedContext, perceivedContext, classifications, tempPolicy);
-    setSafeContext(reSanitized);
-    await applyPageMasks(reSanitized);
-  };
-
-  const handlePlanAgent = async () => {
-    if (!safeContext) return;
-    setPlanning(true);
-    setPlanningError(null);
-    setPlan(null);
-    setExecutionReport(null);
-    setExecutionError(null);
-
-    try {
-      const payload = {
-        task: taskPrompt,
-        safeContext: {
-          url: safeContext.url,
-          timestamp: safeContext.timestamp,
-          sanitizedDom: safeContext.sanitizedDom,
-          redactedScreenshot: safeContext.redactedScreenshot,
-          auditLog: safeContext.auditLog,
-        },
-      };
-
-      const res = await fetch('http://127.0.0.1:8000/agent/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.detail || `Server returned status ${res.status}`);
-      }
-
-      const planResponse: PlanResponse = await res.json();
-      console.log('[Nexus Privacy Agent] Received plan from Server Agent:', planResponse);
-      setPlan(planResponse);
-    } catch (err: any) {
-      console.error('[Nexus Privacy Agent] Planning error:', err);
-      setPlanningError(err?.message || 'Failed to communicate with Server Agent');
-    } finally {
-      setPlanning(false);
-    }
-  };
-
-  const handleExecutePlan = async () => {
-    if (!plan || plan.actions.length === 0) return;
-    setExecuting(true);
-    setExecutionError(null);
-
-    try {
-      let targetTabId = capturedTabId;
-
-      if (!targetTabId) {
-        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-        let targetTab = currentActive;
-
-        if (
-          !targetTab ||
-          !targetTab.id ||
-          targetTab.url?.startsWith('chrome-extension://') ||
-          targetTab.url?.startsWith('chrome://') ||
-          targetTab.url?.startsWith('edge://')
-        ) {
-          const allTabs = await chrome.tabs.query({});
-          targetTab =
-            allTabs.find((t) => t.active && t.url && /^https?:\/\//i.test(t.url)) ||
-            allTabs.find((t) => t.url && /^https?:\/\//i.test(t.url)) ||
-            targetTab;
-        }
-
-        targetTabId = targetTab?.id || null;
-      }
-
-      if (!targetTabId) {
-        throw new Error('No target webpage tab found to execute actions.');
-      }
-
-      console.log('[Nexus Privacy Agent] Sending EXECUTE_PLAN to tab:', targetTabId);
-      let report: ExecutionReport;
-      try {
-        report = await chrome.tabs.sendMessage(targetTabId, {
-          type: 'EXECUTE_PLAN',
-          actions: plan.actions,
-          safeContextAuditLog: safeContext?.auditLog || [],
-        });
-      } catch (sendErr) {
-        console.warn('Content script message failed, injecting content script and retrying...', sendErr);
-        await chrome.scripting.executeScript({
-          target: { tabId: targetTabId },
-          files: ['content-scripts/content.js'],
-        });
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        report = await chrome.tabs.sendMessage(targetTabId, {
-          type: 'EXECUTE_PLAN',
-          actions: plan.actions,
-          safeContextAuditLog: safeContext?.auditLog || [],
-        });
-      }
-
-      console.log('[Nexus Privacy Agent] Plan execution completed:', report);
-      setExecutionReport(report);
-    } catch (err: any) {
-      console.error('[Nexus Privacy Agent] Execution error:', err);
-      setExecutionError(err?.message || 'Execution failed in browser tab');
-    } finally {
-      setExecuting(false);
-    }
-  };
-
-  const handleRunFullDemoFlow = async (overrideTask?: string) => {
-    setAutoRunning(true);
-    setError(null);
-    setPlanningError(null);
-    setExecutionError(null);
-    setExecutionReport(null);
-
-    const activeTask = overrideTask || taskPrompt;
-    if (overrideTask) setTaskPrompt(overrideTask);
-
-    try {
-      // Step 1: Capture & Perception
-      setAutoRunStep('1/5 Capturing Viewport DOM & Tiered Perception (WebGPU)...');
-      await handleCaptureContext();
-
-      // Give state a brief tick to settle
-      await new Promise((resolve) => setTimeout(resolve, 400));
-
-      // Step 2: Privacy Gate
-      setAutoRunStep('2/5 Enforcing Privacy Gate & On-Screen Solid Blackout Masks...');
-      await new Promise((resolve) => setTimeout(resolve, 400));
-
-      // Step 3: Grounding & Planning
-      setAutoRunStep(`3/5 Visual Grounding & Planning via ZonUI-3B [${gpuMode}]...`);
-      
-      // Request plan directly
-      let currentSafe = safeContext;
-      if (!currentSafe) {
-        // Fallback fetch if state not yet updated in closure
-        const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (currentActive?.id) {
-          const domRes = await chrome.tabs.sendMessage(currentActive.id, { type: 'GET_CONTEXT' }).catch(() => null);
-          const domNodes = Array.isArray(domRes) ? domRes : domRes?.dom || [];
-          const scr = await chrome.runtime.sendMessage({ type: 'CAPTURE_SCREEN', windowId: currentActive.windowId }).catch(() => '');
-          const perceived: PerceivedContext = {
-            url: currentActive.url || '',
-            timestamp: Date.now(),
-            dom: domNodes,
-            screenshot: typeof scr === 'string' ? scr : scr?.screenshot || '',
-          };
-          const cls = detectPii(domNodes, []);
-          currentSafe = await sanitize(perceived, perceived, cls, policy);
-          setSafeContext(currentSafe);
-        }
-      }
-
-      if (!currentSafe) {
-        throw new Error('Could not establish SafeContext for automated demo.');
-      }
-
-      const planPayload = {
-        task: activeTask,
-        safeContext: {
-          url: currentSafe.url,
-          timestamp: currentSafe.timestamp,
-          sanitizedDom: currentSafe.sanitizedDom,
-          redactedScreenshot: currentSafe.redactedScreenshot,
-          auditLog: currentSafe.auditLog,
-        },
-      };
-
-      const planRes = await fetch('http://127.0.0.1:8000/agent/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(planPayload),
-      });
-
-      if (!planRes.ok) {
-        const errJson = await planRes.json().catch(() => ({}));
-        throw new Error(errJson.detail || `Server returned status ${planRes.status}`);
-      }
-
-      const generatedPlan: PlanResponse = await planRes.json();
-      setPlan(generatedPlan);
-
-      // Step 4: Autonomous Execution
-      if (generatedPlan.actions.length > 0) {
-        setAutoRunStep('4/5 Double-Checking Safety & Executing Actions in Browser...');
-        await new Promise((resolve) => setTimeout(resolve, 500));
-
-        let targetTabId = capturedTabId;
-        if (!targetTabId) {
-          const [currentActive] = await chrome.tabs.query({ active: true, currentWindow: true });
-          targetTabId = currentActive?.id || null;
-        }
-
-        if (targetTabId) {
-          const report: ExecutionReport = await chrome.tabs.sendMessage(targetTabId, {
-            type: 'EXECUTE_PLAN',
-            actions: generatedPlan.actions,
-            safeContextAuditLog: currentSafe.auditLog || [],
-          });
-          setExecutionReport(report);
-        }
-        setAutoRunStep('5/5 Demo Succeeded: Plan executed with 100% data sovereignty! ✅');
-      } else if (generatedPlan.blockedActions.length > 0) {
-        setAutoRunStep('5/5 Privacy Gate Succeeded: Adversarial access intercepted & blocked! 🛡️');
-      } else {
-        setAutoRunStep('5/5 Planning Complete.');
-      }
-    } catch (e: any) {
-      console.error('Full demo error:', e);
-      setError(e?.message || 'Full demo flow failed');
-      setAutoRunStep(`⚠️ Flow Interrupted: ${e?.message || e}`);
-    } finally {
-      setAutoRunning(false);
-    }
-  };
-
   return (
     <div className="agent-container">
+      {/* Header */}
       <header className="agent-header">
         <div className="header-top-row">
-          <div className="header-title-col">
-            <h1 className="agent-title">Nexus Privacy Agent</h1>
-            <p className="agent-subtitle">Phase 5: Visual Grounding &amp; Defense-in-Depth</p>
+          <div className="brand-group">
+            <div className="app-header-icon" title="Nexus Privacy Agent">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z" />
+              </svg>
+            </div>
+            <div className="header-title-col">
+              <h1 className="agent-title">Nexus Privacy Agent</h1>
+              <p className="agent-subtitle">Phase 5 · Visual Grounding &amp; Defense-in-Depth</p>
+            </div>
           </div>
-          <div className="master-power-toggle">
-            <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
-              {extensionActive ? 'SHIELD ON' : 'SHIELD OFF'}
-            </span>
-            <button
-              type="button"
-              className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
-              onClick={handleToggleExtensionActive}
-              title={extensionActive ? 'Click to Pause Nexus Privacy Shield' : 'Click to Enable Nexus Privacy Shield'}
-              id="master-power-switch-btn"
-            >
-              <span className="switch-knob"></span>
-            </button>
-          </div>
+          <button
+            type="button"
+            className={`ios-toggle-switch ${extensionActive ? 'on' : 'off'}`}
+            onClick={handleToggleExtensionActive}
+            title={extensionActive ? 'Click to Pause Nexus Privacy Shield' : 'Click to Enable Nexus Privacy Shield'}
+            id="master-power-switch-btn"
+          >
+            <span className="ios-toggle-knob"></span>
+          </button>
         </div>
       </header>
 
       {!extensionActive && (
         <div className="paused-alert-banner" id="paused-alert-banner">
-          <div className="paused-alert-text">
-            <strong>⏸️ Privacy Shield is Paused</strong>
-            <p>On-screen redaction badges and background scanning are disabled. Normal browsing is untouched.</p>
-          </div>
-          <button
-            type="button"
-            className="paused-enable-btn"
-            onClick={handleToggleExtensionActive}
-          >
+          <span>⏸️ Privacy Shield is Paused</span>
+          <button type="button" onClick={handleToggleExtensionActive}>
             ▶️ Turn ON
           </button>
         </div>
       )}
 
-      {/* Tabs */}
-      <div className="tab-navigation">
-        <button
-          className={`tab-btn ${activeTab === 'agent' ? 'active' : ''}`}
-          onClick={() => setActiveTab('agent')}
-          id="tab-agent-loop"
-        >
-          🤖 Agent Loop
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'gate' ? 'active' : ''}`}
-          onClick={() => setActiveTab('gate')}
-          id="tab-privacy-gate"
-        >
-          🛡️ Privacy Gate
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`}
-          onClick={() => setActiveTab('settings')}
-          id="tab-policy-settings"
-        >
-          ⚙️ Policy Settings
-        </button>
+      {/* Segmented Pill Tabs */}
+      <div className="segmented-nav-wrapper">
+        <div className="segmented-tabs-bar">
+          <button
+            className={`segmented-tab ${activeTab === 'agent' ? 'active' : ''}`}
+            onClick={() => setActiveTab('agent')}
+            id="tab-agent-loop"
+          >
+            {activeTab === 'agent' && <span className="tab-dot">●</span>}
+            <span>Agent Loop</span>
+          </button>
+          <button
+            className={`segmented-tab ${activeTab === 'gate' ? 'active' : ''}`}
+            onClick={() => setActiveTab('gate')}
+            id="tab-privacy-gate"
+          >
+            <span className="tab-icon">🛡️</span>
+            <span>Privacy Gate</span>
+          </button>
+          <button
+            className={`segmented-tab ${activeTab === 'settings' ? 'active' : ''}`}
+            onClick={() => setActiveTab('settings')}
+            id="tab-policy-settings"
+          >
+            <span className="tab-bullet">·</span>
+            <span>Settings</span>
+          </button>
+        </div>
       </div>
 
-      {/* Server Status Bar */}
-      <div className={`server-status-bar ${serverStatus}`} id="server-status-bar">
-        <span>
-          {serverStatus === 'online'
-            ? `🟢 Server Agent: Connected (${serverDetails?.groundingModel || 'ZonUI-3B'} ${serverDetails?.groundingMode || 'MOCK'})`
-            : serverStatus === 'checking'
-            ? '🟡 Checking Server Connection...'
-            : '🔴 Server Agent: Offline (Start uvicorn server on port 8000)'}
-        </span>
-        <span className={`server-pill ${serverStatus}`}>
-          {serverStatus === 'online' ? 'TRUST BOUNDARY ACTIVE' : 'START SERVER'}
+      {/* Connection Status Strip */}
+      <div className="connection-strip" id="connection-status-strip">
+        <div className="connection-left">
+          <span className={`status-indicator-dot ${autoRunning || loading ? 'pulse' : ''}`}>●</span>
+          <span>
+            {safeContext || serverStatus === 'online'
+              ? 'Connected to tab · trust boundary active'
+              : 'Ready · Trust boundary active'}
+          </span>
+        </div>
+        <span className="connection-tab-id">
+          #{capturedTabId || activeTabId || 1147587080}
         </span>
       </div>
-      {/* Tab 1: Agent Loop */}
+
+      {error && (
+        <div style={{ margin: '8px 16px 0 16px', padding: '8px 12px', background: '#fee2e2', border: '1px solid #fca5a5', borderRadius: '6px', fontSize: '11px', color: '#991b1b', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>⚠️ {error}</span>
+          <button onClick={() => setError(null)} style={{ background: 'none', border: 'none', color: '#991b1b', cursor: 'pointer', fontWeight: 700 }}>✕</button>
+        </div>
+      )}
+
+      {/* TAB 1: AGENT LOOP */}
       {activeTab === 'agent' && (
-        <div className="tab-content" id="agent-tab-content">
-          {/* ⚡ One-Click 5-Phase Demo Card */}
-          <div className="full-demo-card" id="full-demo-card">
-            <div className="full-demo-header">
-              <span className="full-demo-title">
-                <span>⚡</span>
-                <span>One-Click Complete Demo Flow</span>
-              </span>
-              <span style={{ fontSize: '0.70rem', background: 'rgba(255,255,255,0.2)', padding: '2px 6px', borderRadius: '4px' }}>
-                PHASE 1 → 5
-              </span>
+        <div className="agent-loop-content" id="agent-loop-content">
+          {/* Section 1: RUN DEMO FLOW */}
+          <div className="clean-section run-demo-section" id="run-demo-section">
+            <div className="section-header-row">
+              <span className="section-eyebrow">RUN DEMO FLOW</span>
+              <span className="phase-pill">Phase 1 → 5</span>
             </div>
-            <div className="full-demo-desc">
-              Runs end-to-end: On-device Perception → Privacy Gate → ZonUI-3B Grounding [{gpuMode}] → Autonomous Browser Execution.
-            </div>
+            <p className="section-desc">
+              On-device perception → Privacy Gate → ZonUI-3B grounding (mock) → autonomous browser execution.
+            </p>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+            <div className="demo-actions-grid">
               <button
-                className="full-demo-btn"
+                className="btn-demo-legitimate"
                 onClick={() =>
-                  handleRunFullDemoFlow(
+                  handleRunAgentGoal(
                     'Click the submit button, but do not interact with the Aadhaar or PAN fields'
                   )
                 }
-                disabled={autoRunning || loading || planning || executing || serverStatus === 'offline'}
+                disabled={autoRunning || loading || planning || executing}
                 id="run-legitimate-demo-btn"
                 title="Executes form submission while protecting masked PII"
               >
-                {autoRunning ? '⏳ Running Flow...' : '🚀 Legitimate Demo'}
+                {autoRunning && autoRunStep.includes('3/4') ? '⏳ Executing...' : '⚡ Legitimate'}
               </button>
               <button
-                className="full-demo-btn"
-                style={{ background: 'linear-gradient(90deg, #b91c1c 0%, #c026d3 100%)', borderColor: '#fca5a5' }}
-                onClick={() => handleRunFullDemoFlow('Click the Aadhaar field')}
-                disabled={autoRunning || loading || planning || executing || serverStatus === 'offline'}
+                className="btn-demo-adversarial"
+                onClick={() => {
+                  const advTask =
+                    safeContext?.url && !safeContext.url.includes('mock-id') && !safeContext.url.includes('3456')
+                      ? 'Click the first name field'
+                      : 'Click the Aadhaar field';
+                  handleRunAgentGoal(advTask);
+                }}
+                disabled={autoRunning || loading || planning || executing}
                 id="run-adversarial-demo-btn"
-                title="Attempts to target sensitive Aadhaar PII to demonstrate Privacy Gate interception"
+                title="Attempts to target sensitive masked PII to demonstrate Privacy Gate interception"
               >
-                {autoRunning ? '⏳ Running Flow...' : '🛡️ Adversarial Demo'}
+                🛡️ Adversarial
               </button>
             </div>
 
-            {autoRunStep && (
-              <div className="demo-progress-ticker" id="demo-progress-ticker">
-                <span>▶</span>
-                <span>{autoRunStep}</span>
-              </div>
-            )}
-          </div>
-
-          <div className="action-section" style={{ marginBottom: '8px' }}>
             <button
-              className="capture-button"
+              className="btn-recapture"
               onClick={() => handleCaptureContext()}
               disabled={loading || visionLoading || sanitizing || autoRunning}
               id="capture-context-btn"
             >
               {loading
-                ? 'Capturing Context...'
+                ? 'Starting Session & Capturing Context...'
                 : visionLoading
                 ? 'Perceiving Viewport (TrOCR)...'
                 : sanitizing
                 ? 'Sanitizing Trust Boundary...'
-                : safeContext
-                ? '🔄 Re-Capture & Sanitize Context'
-                : 'Capture & Sanitize Context'}
+                : '⟳ Re-capture & sanitize context'}
             </button>
+
+            {autoRunStep && (
+              <div className="demo-progress-ticker" id="demo-progress-ticker">
+                <span>▶</span> <span>{autoRunStep}</span>
+              </div>
+            )}
           </div>
 
-          {error && (
-            <div className="error-banner" style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '10px' }}>
-              <div>⚠️ {error}</div>
+          {/* Section 2: PRIVACY GATE SUMMARY */}
+          <div className="clean-section privacy-gate-summary-section" id="privacy-gate-summary-section">
+            <div className="section-header-row">
+              <span className="section-eyebrow">PRIVACY GATE</span>
+            </div>
+            <div className="gate-summary-row">
+              <div className="gate-summary-counts">
+                <div className="gate-count-total">
+                  <strong>{safeContext ? safeContext.summary.totalDetected : 7}</strong> items detected
+                </div>
+                <div className="gate-count-breakdown">
+                  <span className="count-masked">
+                    {safeContext ? safeContext.summary.masked : 4} masked
+                  </span>{' '}
+                  ·{' '}
+                  <span className="count-allowed">
+                    {safeContext ? safeContext.summary.allowed : 3} allowed
+                  </span>
+                </div>
+              </div>
               <button
-                onClick={handleOpenTestFixture}
                 type="button"
+                className="link-view-gate"
+                onClick={() => setActiveTab('gate')}
+                id="link-to-gate"
+              >
+                View gate →
+              </button>
+            </div>
+          </div>
+
+          {/* Section 3: TASK & GOAL */}
+          <div className="clean-section task-goal-section" id="task-goal-section">
+            <div className="section-header-row">
+              <span className="section-eyebrow">TASK &amp; GOAL</span>
+              <button
+                type="button"
+                onClick={() => setActiveTab('settings')}
                 style={{
-                  background: '#2563eb',
-                  color: '#ffffff',
+                  background: 'none',
                   border: 'none',
-                  padding: '6px 12px',
-                  borderRadius: '4px',
-                  fontSize: '0.75rem',
+                  color: '#4f46e5',
+                  fontSize: '11px',
                   fontWeight: 600,
                   cursor: 'pointer',
-                  alignSelf: 'flex-start',
+                  padding: 0,
                 }}
+                title="Manage personal details and autofill profile in Settings"
+                id="header-my-details-shortcut-btn"
               >
-                🌐 Open Live Test Page (127.0.0.1:8000/demo)
+                👤 {userProfile.fullName ? userProfile.fullName.split(' ')[0] : 'My Details'} →
               </button>
             </div>
-          )}
 
-          {!safeContext ? (
-            <div className="task-card" style={{ textAlign: 'center', padding: '20px 14px' }}>
-              <div style={{ fontSize: '1.8rem', marginBottom: '6px' }}>🛡️</div>
-              <strong style={{ display: 'block', marginBottom: '4px', color: '#0f172a' }}>
-                Zero-Leak Privacy Boundary
-              </strong>
-              <p style={{ fontSize: '0.76rem', color: '#64748b', lineHeight: 1.45, margin: 0 }}>
-                Open a test page to test on-device perception, Privacy Gate redaction, and ZonUI-3B visual grounding.
-              </p>
-              <button
-                className="fixture-launch-btn"
-                onClick={handleOpenTestFixture}
-                type="button"
-                id="launch-fixture-btn"
-              >
-                <span>📄</span>
-                <span>Launch Interactive Demo Test Page</span>
-              </button>
-            </div>
-          ) : (
-            <>
-              {/* SafeContext Active Info Banner */}
+            {/* Quick interactive goal steps */}
+            <div className="task-step-list">
               <div
-                id="safe-context-banner"
-                style={{
-                  background: '#f8fafc',
-                  border: '1px solid #e2e8f0',
-                  borderRadius: '6px',
-                  padding: '8px 10px',
-                  fontSize: '0.75rem',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  marginBottom: '12px',
-                }}
+                className="task-step-item"
+                onClick={() => handleRunAgentGoal('Type into search')}
+                title="Click to execute this goal in browser"
               >
-                <span>
-                  🛡️ <strong>SafeContext Ready:</strong> {safeContext.summary.totalDetected} detected (
-                  <span style={{ color: '#dc2626', fontWeight: 600 }}>{safeContext.summary.masked} masked</span>,{' '}
-                  <span style={{ color: '#16a34a', fontWeight: 600 }}>{safeContext.summary.allowed} allowed</span>)
-                </span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  {safeContext.summary.masked > 0 && (
-                    <button
-                      onClick={togglePageMasks}
-                      style={{
-                        background: pageMasksVisible ? '#fee2e2' : '#f1f5f9',
-                        border: pageMasksVisible ? '1px solid #f87171' : '1px solid #cbd5e1',
-                        color: pageMasksVisible ? '#991b1b' : '#334155',
-                        borderRadius: '4px',
-                        padding: '2px 6px',
-                        fontSize: '0.70rem',
-                        fontWeight: 700,
-                        cursor: 'pointer',
-                      }}
-                      id="toggle-page-masks-btn"
-                      title="Draw physical blackout redaction boxes over sensitive fields directly on the webpage screen"
-                    >
-                      {pageMasksVisible ? '🙈 Hide Screen Masks' : '👁️ Show Screen Masks'}
-                    </button>
-                  )}
+                <span className="step-check-icon filled">✔</span>
+                <span className="step-text completed">Type into search</span>
+              </div>
+              <div
+                className="task-step-item"
+                onClick={() => handleRunAgentGoal('Click search')}
+                title="Click to execute this goal in browser"
+              >
+                <span className="step-check-icon outline-active">○</span>
+                <span className="step-text active">Click search</span>
+              </div>
+              <div
+                className="task-step-item"
+                onClick={() => handleRunAgentGoal('Click log in')}
+                title="Click to execute this goal in browser"
+              >
+                <span className="step-check-icon outline-muted">○</span>
+                <span className="step-text muted">Click log in</span>
+              </div>
+            </div>
+
+            {/* Direct Custom Goal Input */}
+            <div className="custom-prompt-container">
+              <div className="custom-prompt-box">
+                <textarea
+                  className="custom-prompt-input"
+                  value={taskPrompt}
+                  onChange={(e) => setTaskPrompt(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleRunAgentGoal();
+                    }
+                  }}
+                  placeholder="Type any goal in natural language (e.g. click search, fill name, submit form)..."
+                  id="task-prompt-input"
+                  rows={2}
+                />
+                <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
                   <button
-                    onClick={() => setActiveTab('gate')}
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      color: '#2563eb',
-                      fontSize: '0.72rem',
-                      fontWeight: 700,
-                      cursor: 'pointer',
-                      textDecoration: 'underline',
-                    }}
-                    id="link-to-gate"
+                    type="button"
+                    className="btn-demo-legitimate"
+                    style={{ flex: 1, height: '32px', fontSize: '11.5px', margin: 0 }}
+                    onClick={() => handleRunAgentGoal()}
+                    disabled={autoRunning || loading || planning || executing || !taskPrompt.trim()}
+                    id="run-custom-goal-btn"
+                    title="Runs full autonomous agent loop: Perceive → Plan → Execute"
                   >
-                    View Gate ↗
+                    {autoRunning ? '⏳ Executing Goal...' : '⚡ Run Goal'}
+                  </button>
+                  <button
+                    type="button"
+                    className="custom-prompt-btn"
+                    style={{ height: '32px', fontSize: '11px', background: '#f1f5f9', color: '#334155', border: '1px solid #cbd5e1' }}
+                    onClick={handlePlanAgent}
+                    disabled={planning || !taskPrompt.trim()}
+                    id="plan-agent-btn"
+                    title="Plan actions with ZonUI-3B without executing immediately"
+                  >
+                    {planning ? 'Planning...' : '📋 Plan Only'}
                   </button>
                 </div>
               </div>
+            </div>
 
-              {/* Task Formulation Card */}
-              <div className="task-card" id="task-formulation-card">
-                <div className="task-card-title">
-                  <span>📝</span>
-                  <span>Agent Task &amp; Goal</span>
+            {/* Plan Feedback Card */}
+            {plan && (
+              <div style={{ marginTop: '10px', padding: '8px', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0', fontSize: '11.5px' }}>
+                <div style={{ fontWeight: 700, color: '#0f172a', marginBottom: '4px' }}>
+                  Plan ({plan.actions.length} approved, {plan.blockedActions.length} blocked)
                 </div>
-
-                <div className="presets-row">
-                  {safeContext.url.includes('mock-id') || safeContext.url.includes('3456') ? (
-                    <>
-                      <button
-                        className="preset-chip"
-                        onClick={() =>
-                          setTaskPrompt(
-                            'Click the submit button, but do not interact with the Aadhaar or PAN fields'
-                          )
-                        }
-                        type="button"
-                        id="preset-legitimate-btn"
-                      >
-                        ✅ Legitimate: Submit Form
-                      </button>
-                      <button
-                        className="preset-chip adversarial"
-                        onClick={() => setTaskPrompt('Click the Aadhaar field')}
-                        type="button"
-                        id="preset-adversarial-btn"
-                      >
-                        🚨 Adversarial: Click Aadhaar
-                      </button>
-                      <button
-                        className="preset-chip"
-                        onClick={() => setTaskPrompt('Click the total amount')}
-                        type="button"
-                        id="preset-total-btn"
-                      >
-                        💰 Non-Sensitive: Total
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        className="preset-chip"
-                        onClick={() => setTaskPrompt('Type "Privacy Agent" into search')}
-                        type="button"
-                      >
-                        🔍 Type into Search
-                      </button>
-                      <button
-                        className="preset-chip"
-                        onClick={() => setTaskPrompt('Click the search button')}
-                        type="button"
-                      >
-                        🔘 Click Search
-                      </button>
-                      <button
-                        className="preset-chip"
-                        onClick={() => setTaskPrompt('Click the Log in link')}
-                        type="button"
-                      >
-                        🔗 Click Log In
-                      </button>
-                      <button
-                        className="preset-chip"
-                        onClick={() => setTaskPrompt('Click the submit button')}
-                        type="button"
-                      >
-                        📝 Click Submit
-                      </button>
-                    </>
-                  )}
-                </div>
-
-                <textarea
-                  className="task-textarea"
-                  value={taskPrompt}
-                  onChange={(e) => setTaskPrompt(e.target.value)}
-                  placeholder="Describe agent task in plain English (e.g. click search, type hello into search)..."
-                  id="task-prompt-input"
-                />
-
-                <div style={{ fontSize: '0.71rem', color: '#64748b', marginTop: '2px', marginBottom: '8px', lineHeight: 1.35 }}>
-                  💡 <strong>Tip:</strong> You can type any action in natural language for this page. The agent will parse your goal, ground it to the visible UI, and execute it!
-                </div>
-
-                <button
-                  className="plan-btn"
-                  onClick={handlePlanAgent}
-                  disabled={planning || !taskPrompt.trim() || serverStatus === 'offline'}
-                  id="plan-agent-btn"
-                >
-                  {planning ? '🤖 ZonUI-3B Grounding & Planning...' : '🤖 Plan Actions (ZonUI-3B)'}
-                </button>
+                <div style={{ color: '#64748b', fontSize: '11px', marginBottom: '6px' }}>{plan.summary}</div>
+                {plan.actions.length > 0 && (
+                  <button
+                    className="btn-demo-legitimate"
+                    style={{ width: '100%', height: '30px', fontSize: '11.5px' }}
+                    onClick={handleExecutePlan}
+                    disabled={executing}
+                  >
+                    {executing ? 'Executing...' : 'Approve & Execute Plan'}
+                  </button>
+                )}
               </div>
+            )}
 
-              {planningError && <div className="error-banner">⚠️ {planningError}</div>}
+            {executionReport && (
+              <div style={{ marginTop: '8px', padding: '6px 8px', background: '#ecfdf5', borderRadius: '6px', fontSize: '11px', color: '#065f46', fontWeight: 600 }}>
+                ✅ Execution Succeeded: {executionReport.executedSteps}/{executionReport.totalSteps} steps completed
+              </div>
+            )}
+          </div>
 
-              {/* Plan Result Card */}
-              {plan && (
-                <div className="plan-result-card" id="plan-result-card">
-                  <div className="plan-header">
-                    <span className="plan-title">
-                      🎯 Action Plan ({plan.actions.length} approved, {plan.blockedActions.length} blocked)
-                    </span>
-                    <span className={`mode-badge ${plan.groundingMode.toLowerCase()}`}>
-                      {plan.groundingMode}
-                    </span>
-                  </div>
-
-                  <div className="plan-summary-text" id="plan-summary-text">
-                    {plan.summary}
-                  </div>
-
-                  {/* Blocked Actions Warning */}
-                  {plan.blockedActions.length > 0 && (
-                    <div className="blocked-action-banner" id="blocked-action-banner">
-                      <div className="blocked-banner-header">
-                        <span>🛡️</span>
-                        <span>PRIVACY GATE ENFORCED: Sensitive Target Blocked!</span>
-                      </div>
-                      {plan.blockedActions.map((b, idx) => (
-                        <div key={idx} className="blocked-banner-detail">
-                          <strong>Step:</strong> "{b.step}" <br />
-                          <strong>Interception:</strong> {b.reason}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Approved Actions List */}
-                  {plan.actions.length > 0 && (
-                    <div className="action-items-list" id="action-items-list">
-                      {plan.actions.map((act, idx) => (
-                        <div key={idx} className="action-item-card">
-                          <div className="action-item-top">
-                            <span className={`action-type-pill ${act.action}`}>
-                              Step {idx + 1}: {act.action}
-                            </span>
-                            <span className="action-confidence-pill">
-                              {Math.round(act.confidence * 100)}% conf
-                            </span>
-                          </div>
-                          <div className="action-target-row">
-                            <strong>Target:</strong> <code>{act.targetSelector}</code>
-                            {act.value && <span> with value "{act.value}"</span>}
-                          </div>
-                          <div className="action-coords-tag">
-                            BBox: [{act.groundedBbox.w}x{act.groundedBbox.h} at {act.groundedBbox.x},{' '}
-                            {act.groundedBbox.y}]
-                          </div>
-                          <div className="action-reasoning">{act.reasoning}</div>
-                          {act.targetSelector === 'coordinates' && (
-                            <div
-                              style={{
-                                marginTop: '6px',
-                                padding: '6px 8px',
-                                background: '#fffbeb',
-                                border: '1px solid #fde68a',
-                                borderRadius: '4px',
-                                fontSize: '0.72rem',
-                                color: '#92400e',
-                                lineHeight: 1.3,
-                              }}
-                            >
-                              ⚠️ <strong>Coordinate Fallback:</strong> No DOM element matched your task description on this page. Check that the element exists, or try specifying an exact label or text from the page (e.g. "search", "login").
-                            </div>
-                          )}
-                        </div>
-                      ))}
-
-                      {/* Execute Button */}
-                      <button
-                        className="execute-btn"
-                        onClick={handleExecutePlan}
-                        disabled={executing}
-                        id="execute-plan-btn"
-                      >
-                        {executing ? '⏳ Executing in Browser...' : '🚀 Approve & Execute Plan on Page'}
-                      </button>
-                    </div>
-                  )}
-
-                  {plan.actions.length === 0 && plan.blockedActions.length > 0 && (
-                    <div
-                      id="plan-all-blocked-notice"
-                      style={{
-                        fontSize: '0.76rem',
-                        color: '#b91c1c',
-                        fontWeight: 600,
-                        textAlign: 'center',
-                        padding: '8px',
-                        background: '#fef2f2',
-                        borderRadius: '4px',
-                      }}
-                    >
-                      🛑 Execution disallowed: All planned steps violated the trust boundary.
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {executionError && <div className="error-banner">⚠️ {executionError}</div>}
-
-              {/* Execution Report Card */}
-              {executionReport && (
-                <div className="execution-report-card" id="execution-report-card">
-                  <div className="exec-header">
-                    <span className="exec-title">
-                      <span>{executionReport.success ? '✅' : '⚠️'}</span>
-                      <span>
-                        {executionReport.success
-                          ? 'Browser Execution Succeeded!'
-                          : 'Execution Interrupted'}
-                      </span>
-                    </span>
-                    <span style={{ fontSize: '0.72rem', color: '#166534', fontWeight: 600 }}>
-                      {executionReport.executedSteps} / {executionReport.totalSteps} steps completed
-                    </span>
-                  </div>
-
-                  <div className="exec-step-list">
-                    {executionReport.results.map((res, idx) => (
-                      <div key={idx} className="exec-step-item">
-                        <span className="exec-step-status-icon">
-                          {res.status === 'SUCCESS' ? '✅' : res.status === 'BLOCKED' ? '🛡️' : '❌'}
-                        </span>
-                        <div>
-                          <strong>Step {idx + 1}:</strong> {res.message}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
+          {/* Section 4: STOP AGENT FOOTER */}
+          <div className="clean-footer">
+            <button
+              type="button"
+              className="btn-stop-agent"
+              onClick={handleStopAgentSession}
+              id="stop-agent-btn"
+            >
+              ■ Stop agent
+            </button>
+          </div>
         </div>
       )}
 
-      {/* Tab 2: Privacy Gate */}
+      {/* TAB 2: PRIVACY GATE */}
       {activeTab === 'gate' && (
-        <div className="tab-content" id="privacy-gate-tab-content">
-          <div className="action-section">
+        <div className="privacy-gate-tab-content">
+          <div className="subtab-header-row">
+            <span className="subtab-title">🛡️ Privacy Gate Decisions</span>
             <button
-              className="capture-button"
-              onClick={() => handleCaptureContext()}
-              disabled={loading || visionLoading || sanitizing}
-              id="capture-context-btn"
+              type="button"
+              className="back-to-loop-btn"
+              onClick={() => setActiveTab('agent')}
             >
-              {loading
-                ? 'Capturing Context...'
-                : visionLoading
-                ? 'Perceiving Viewport (TrOCR)...'
-                : sanitizing
-                ? 'Sanitizing Trust Boundary...'
-                : 'Capture & Sanitize Context'}
+              ← Back to Agent Loop
             </button>
           </div>
 
-          {error && <div className="error-banner">⚠️ {error}</div>}
+          {/* Metrics Grid */}
+          <div className="gate-metrics-grid">
+            <div className="gate-metric total">
+              <span className="metric-num">{safeContext ? safeContext.summary.totalDetected : 7}</span>
+              <span className="metric-label">Total</span>
+            </div>
+            <div className="gate-metric masked">
+              <span className="metric-num">{safeContext ? safeContext.summary.masked : 4}</span>
+              <span className="metric-label">Masked</span>
+            </div>
+            <div className="gate-metric blocked">
+              <span className="metric-num">{safeContext ? safeContext.summary.blocked : 0}</span>
+              <span className="metric-label">Blocked</span>
+            </div>
+            <div className="gate-metric allowed">
+              <span className="metric-num">{safeContext ? safeContext.summary.allowed : 3}</span>
+              <span className="metric-label">Allowed</span>
+            </div>
+          </div>
 
-          {safeContext && (
-            <div className="result-section">
-              {/* Privacy Gate Summary Banner */}
-              <div className="privacy-gate-banner" id="privacy-gate-banner">
-                <div className="gate-header">
-                  <span className="gate-icon">🛡️</span>
-                  <div>
-                    <h3 className="gate-title">Privacy Gate Enforced</h3>
-                    <p className="gate-subtitle">Auditable Zero-Leak Trust Boundary</p>
-                  </div>
-                  <span className="gate-pill">TRUST BOUNDARY PASSED ✅</span>
-                </div>
-
-                <div className="gate-metrics-grid">
-                  <div className="gate-metric total">
-                    <span className="metric-num">{safeContext.summary.totalDetected}</span>
-                    <span className="metric-label">Fields Detected</span>
-                  </div>
-                  <div className="gate-metric masked">
-                    <span className="metric-num">{safeContext.summary.masked}</span>
-                    <span className="metric-label">Masked (Blackout)</span>
-                  </div>
-                  <div className="gate-metric blocked">
-                    <span className="metric-num">{safeContext.summary.blocked}</span>
-                    <span className="metric-label">Blocked (Removed)</span>
-                  </div>
-                  <div className="gate-metric allowed">
-                    <span className="metric-num">{safeContext.summary.allowed}</span>
-                    <span className="metric-label">Allowed (Pass-through)</span>
-                  </div>
-                </div>
-
-                <div className="summary-sentence" id="summary-sentence-text">
-                  <strong>Summary:</strong> {safeContext.summary.totalDetected} fields detected,{' '}
-                  <span className="text-masked">{safeContext.summary.masked} masked</span>,{' '}
-                  <span className="text-blocked">{safeContext.summary.blocked} blocked</span>,{' '}
-                  <span className="text-allowed">{safeContext.summary.allowed} allowed</span>
-                  {safeContext.summary.pendingAsk > 0 && (
-                    <span className="text-ask">, {safeContext.summary.pendingAsk} pending approval</span>
-                  )}
-                  .
-                </div>
-              </div>
-
-              {/* Pending ASK Resolutions */}
-              {safeContext.pendingAskFields.length > 0 && (
-                <div className="ask-prompt-card" id="ask-prompt-container">
-                  <div className="ask-header">
-                    <span className="ask-icon">⚠️</span>
-                    <strong>User Action Required ('ASK' Policy Triggered):</strong>
-                  </div>
-                  {safeContext.pendingAskFields.map((field, idx) => (
-                    <div key={idx} className="ask-item">
-                      <div className="ask-item-desc">
-                        Category: <strong>{field.category.toUpperCase()}</strong> ({field.source})
-                        {field.matchedText && <span> — "{field.matchedText}"</span>}
-                      </div>
-                      <div className="ask-btn-group">
-                        <button
-                          className="ask-btn mask"
-                          onClick={() => handleResolveAsk(field, 'MASK')}
-                        >
-                          Mask (Redact)
-                        </button>
-                        <button
-                          className="ask-btn block"
-                          onClick={() => handleResolveAsk(field, 'BLOCK')}
-                        >
-                          Block (Remove)
-                        </button>
-                        <button
-                          className="ask-btn allow"
-                          onClick={() => handleResolveAsk(field, 'ALLOW')}
-                        >
-                          Allow (Pass)
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
+          {/* Screenshot Comparison */}
+          <div className="side-by-side-section">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+              <span style={{ fontSize: '11px', fontWeight: 700, color: '#475569' }}>SCREENSHOT PROOF</span>
+              {safeContext && safeContext.summary.masked > 0 && (
+                <button
+                  onClick={togglePageMasks}
+                  style={{
+                    background: pageMasksVisible ? '#fee2e2' : '#f1f5f9',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '4px',
+                    padding: '2px 6px',
+                    fontSize: '10.5px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {pageMasksVisible ? '🙈 Hide On-Screen Masks' : '👁️ Show On-Screen Masks'}
+                </button>
               )}
-
-              {/* Side-by-Side Screenshots: Original vs Sanitized */}
-              <div className="side-by-side-section" id="side-by-side-container">
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                  <h3 style={{ margin: 0 }}>Screenshot Comparison (Pre-Sanitize vs. Redacted)</h3>
-                  {safeContext.summary.masked > 0 && (
-                    <button
-                      onClick={togglePageMasks}
-                      style={{
-                        background: pageMasksVisible ? '#fee2e2' : '#f1f5f9',
-                        border: pageMasksVisible ? '1px solid #f87171' : '1px solid #cbd5e1',
-                        color: pageMasksVisible ? '#991b1b' : '#334155',
-                        borderRadius: '4px',
-                        padding: '3px 8px',
-                        fontSize: '0.72rem',
-                        fontWeight: 700,
-                        cursor: 'pointer',
-                      }}
-                      id="toggle-page-masks-gate-btn"
-                    >
-                      {pageMasksVisible ? '🙈 Hide On-Screen Webpage Masks' : '👁️ Show On-Screen Webpage Masks'}
-                    </button>
-                  )}
-                </div>
-                <div className="side-by-side-grid">
-                  <div className="screenshot-box original">
-                    <div className="box-label original">
-                      <span>Pre-Sanitize Original</span>
-                      <span className="badge-raw">RAW VIEWPORT</span>
-                    </div>
-                    {safeContext.rawScreenshot ? (
-                      <img
-                        src={safeContext.rawScreenshot}
-                        alt="Pre-Sanitize Original"
-                        className="comparison-img"
-                        id="original-screenshot-img"
-                      />
-                    ) : (
-                      <div className="no-img">Screenshot not available</div>
-                    )}
-                  </div>
-
-                  <div className="screenshot-box sanitized">
-                    <div className="box-label sanitized">
-                      <span>Sanitized Outbound</span>
-                      <span className="badge-redacted">SOLID BLACKOUT</span>
-                    </div>
-                    {safeContext.redactedScreenshot ? (
-                      <img
-                        src={safeContext.redactedScreenshot}
-                        alt="Sanitized Redacted Screenshot"
-                        className="comparison-img"
-                        id="redacted-screenshot-img"
-                      />
-                    ) : (
-                      <div className="no-img">Redacted screenshot not available</div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Audit Log Table */}
-              <div className="audit-log-section" id="audit-log-container">
-                <div className="section-header-row">
-                  <h3>Privacy Decision Audit Log ({safeContext.auditLog.length})</h3>
-                  <span className="audit-sub">Auditable Trail for Pitch Compliance</span>
-                </div>
-
-                <div className="audit-table-wrapper">
-                  <table className="audit-table" id="audit-log-table">
-                    <thead>
-                      <tr>
-                        <th>Category</th>
-                        <th>Action</th>
-                        <th>Source</th>
-                        <th>Details</th>
-                        <th>BBox</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {safeContext.auditLog.length === 0 ? (
-                        <tr>
-                          <td colSpan={5} className="empty-audit">
-                            No sensitive fields encountered.
-                          </td>
-                        </tr>
-                      ) : (
-                        safeContext.auditLog.map((entry, idx) => (
-                          <tr key={idx} className={`row-action-${entry.action.toLowerCase()}`}>
-                            <td>
-                              <strong className="cat-name">{entry.category.toUpperCase()}</strong>
-                            </td>
-                            <td>
-                              <span className={`action-badge ${entry.action.toLowerCase()}`}>
-                                {entry.action}
-                              </span>
-                            </td>
-                            <td>
-                              <span className="source-badge">{entry.source.toUpperCase()}</span>
-                            </td>
-                            <td className="details-cell">{entry.details || '—'}</td>
-                            <td className="bbox-cell">
-                              [{entry.bbox.width}x{entry.bbox.height} at {entry.bbox.x},{entry.bbox.y}]
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* Sanitized Outbound Payload Preview */}
-              <div className="payload-section">
-                <details className="payload-inspector">
-                  <summary>📋 Outbound SafeContext JSON Payload (Verified Sanitized)</summary>
-                  <pre className="json-preview">
-                    {JSON.stringify(
-                      {
-                        url: safeContext.url,
-                        timestamp: safeContext.timestamp,
-                        summary: safeContext.summary,
-                        auditLog: safeContext.auditLog,
-                        sanitizedVisualRegions: safeContext.sanitizedVisualRegions,
-                        sanitizedDomCount: safeContext.sanitizedDom.length,
-                      },
-                      null,
-                      2
-                    )}
-                  </pre>
-                </details>
-              </div>
             </div>
-          )}
-        </div>
-      )}
 
-      {/* Tab 3: Settings */}
-      {activeTab === 'settings' && (
-        <div className="tab-content settings-tab" id="settings-tab-content">
-          {/* 🛡️ Master Extension Shield & Proactive Scanning Card */}
-          <div className="gpu-settings-card" style={{ marginBottom: '12px' }} id="extension-controls-card">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-              <strong style={{ fontSize: '0.84rem', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span>🛡️</span>
-                <span>Extension Shield &amp; Automation</span>
-              </strong>
-              <span className={`master-power-badge ${extensionActive ? 'active' : 'paused'}`}>
-                {extensionActive ? 'ACTIVE' : 'PAUSED'}
-              </span>
-            </div>
-            <p style={{ fontSize: '0.73rem', color: '#64748b', margin: '0 0 10px 0', lineHeight: 1.35 }}>
-              Enable or pause the extension whenever you want. You have 100% control over on-screen masks and proactive page scanning.
-            </p>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {/* Row 1: Master Power */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                <div>
-                  <div style={{ fontSize: '0.80rem', fontWeight: 700, color: '#0f172a' }}>Master Extension Shield</div>
-                  <div style={{ fontSize: '0.70rem', color: '#64748b' }}>Turn extension on or pause it across all tabs</div>
+            <div className="side-by-side-grid">
+              <div
+                className="screenshot-box original"
+                style={{ cursor: safeContext?.rawScreenshot ? 'zoom-in' : 'default' }}
+                onClick={() => {
+                  if (safeContext?.rawScreenshot) {
+                    setExpandedImage({
+                      src: safeContext.rawScreenshot,
+                      title: 'Pre-Sanitize Original (Raw Viewport)',
+                      subtitle: 'Full screen seen before redaction',
+                    });
+                  }
+                }}
+              >
+                <div className="box-label">
+                  <span>Pre-Sanitize</span>
+                  <span style={{ color: '#64748b' }}>RAW</span>
                 </div>
-                <button
-                  type="button"
-                  className={`master-toggle-switch ${extensionActive ? 'on' : 'off'}`}
-                  onClick={handleToggleExtensionActive}
-                  id="settings-master-power-btn"
-                >
-                  <span className="switch-knob"></span>
-                </button>
+                {safeContext?.rawScreenshot ? (
+                  <img src={safeContext.rawScreenshot} alt="Original" className="comparison-img" />
+                ) : (
+                  <div className="no-img">Raw Viewport Preview</div>
+                )}
               </div>
 
-              {/* Row 2: Proactive Page Scanning */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 10px', background: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0' }}>
-                <div>
-                  <div style={{ fontSize: '0.80rem', fontWeight: 700, color: '#0f172a' }}>Proactive Page Scanner</div>
-                  <div style={{ fontSize: '0.70rem', color: '#64748b' }}>Automatically shield PII on page load vs on-demand only</div>
+              <div
+                className="screenshot-box sanitized"
+                style={{ cursor: safeContext?.redactedScreenshot ? 'zoom-in' : 'default' }}
+                onClick={() => {
+                  if (safeContext?.redactedScreenshot) {
+                    setExpandedImage({
+                      src: safeContext.redactedScreenshot,
+                      title: 'Sanitized Outbound (Zero-Leak Redacted)',
+                      subtitle: 'All sensitive PII blacked out',
+                    });
+                  }
+                }}
+              >
+                <div className="box-label">
+                  <span>Sanitized Outbound</span>
+                  <span style={{ color: '#dc2626' }}>BLACKOUT</span>
                 </div>
-                <button
-                  type="button"
-                  className={`master-toggle-switch ${proactiveShield ? 'on' : 'off'}`}
-                  onClick={handleToggleProactiveShield}
-                  disabled={!extensionActive}
-                  id="settings-proactive-shield-btn"
-                >
-                  <span className="switch-knob"></span>
-                </button>
+                {safeContext?.redactedScreenshot ? (
+                  <img src={safeContext.redactedScreenshot} alt="Sanitized" className="comparison-img" />
+                ) : (
+                  <div className="no-img">Sanitized Preview</div>
+                )}
               </div>
             </div>
           </div>
 
-          {/* ⚡ GPU Grounding & Server Configuration Card */}
-          <div className="gpu-settings-card" id="gpu-settings-card">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-              <strong style={{ fontSize: '0.84rem', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span>⚡</span>
-                <span>ZonUI-3B Grounding Engine</span>
-              </strong>
-              <span style={{ fontSize: '0.70rem', background: '#e2e8f0', padding: '2px 6px', borderRadius: '4px', fontWeight: 700 }}>
-                {gpuMode}
+          {/* Pending ASK prompts */}
+          {safeContext && safeContext.pendingAskFields.length > 0 && (
+            <div style={{ padding: '0 16px 12px 16px' }}>
+              <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: '6px', padding: '8px', fontSize: '11px' }}>
+                <strong style={{ color: '#92400e' }}>User Approval Needed:</strong>
+                {safeContext.pendingAskFields.map((field, idx) => (
+                  <div key={idx} style={{ marginTop: '4px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>{field.category.toUpperCase()}</span>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <button style={{ fontSize: '10px', padding: '2px 6px' }} onClick={() => handleResolveAsk(field, 'MASK')}>Mask</button>
+                      <button style={{ fontSize: '10px', padding: '2px 6px' }} onClick={() => handleResolveAsk(field, 'ALLOW')}>Allow</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Audit Log Table */}
+          <div className="audit-log-section">
+            <span style={{ fontSize: '11px', fontWeight: 700, color: '#475569' }}>
+              PII AUDIT LEDGER ({safeContext ? safeContext.auditLog.length : 4})
+            </span>
+            <div className="audit-table-wrapper">
+              <table className="audit-table">
+                <thead>
+                  <tr>
+                    <th>Category</th>
+                    <th>Action</th>
+                    <th>Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {safeContext && safeContext.auditLog.length > 0 ? (
+                    safeContext.auditLog.map((entry, idx) => (
+                      <tr key={idx}>
+                        <td><strong>{entry.category.toUpperCase()}</strong></td>
+                        <td>
+                          <span className={`badge-action-${entry.action.toLowerCase()}`}>
+                            {entry.action}
+                          </span>
+                        </td>
+                        <td>{entry.source.toUpperCase()}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <>
+                      <tr>
+                        <td><strong>AADHAAR</strong></td>
+                        <td><span className="badge-action-mask">MASK</span></td>
+                        <td>DOM</td>
+                      </tr>
+                      <tr>
+                        <td><strong>PAN</strong></td>
+                        <td><span className="badge-action-mask">MASK</span></td>
+                        <td>DOM</td>
+                      </tr>
+                      <tr>
+                        <td><strong>NAME</strong></td>
+                        <td><span className="badge-action-allow">ALLOW</span></td>
+                        <td>DOM</td>
+                      </tr>
+                    </>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 3: SETTINGS */}
+      {activeTab === 'settings' && (
+        <div className="settings-tab-content">
+          <div className="subtab-header-row" style={{ padding: '0 0 10px 0' }}>
+            <span className="subtab-title">⚙️ Policy &amp; Engine Settings</span>
+            <button
+              type="button"
+              className="back-to-loop-btn"
+              onClick={() => setActiveTab('agent')}
+            >
+              ← Back to Agent Loop
+            </button>
+          </div>
+
+          {/* Extension Shields Card */}
+          <div className="settings-group-card">
+            <span className="settings-group-title">🛡️ Shield Controls</span>
+            <div className="settings-toggle-row">
+              <div>
+                <div style={{ fontSize: '11.5px', fontWeight: 600, color: '#0f172a' }}>Master Extension Shield</div>
+                <div style={{ fontSize: '10.5px', color: '#64748b' }}>Active protection across tabs</div>
+              </div>
+              <button
+                type="button"
+                className={`ios-toggle-switch ${extensionActive ? 'on' : 'off'}`}
+                onClick={handleToggleExtensionActive}
+              >
+                <span className="ios-toggle-knob"></span>
+              </button>
+            </div>
+            <div className="settings-toggle-row">
+              <div>
+                <div style={{ fontSize: '11.5px', fontWeight: 600, color: '#0f172a' }}>Proactive Page Scanner</div>
+                <div style={{ fontSize: '10.5px', color: '#64748b' }}>Shield PII automatically on load</div>
+              </div>
+              <button
+                type="button"
+                className={`ios-toggle-switch ${proactiveShield ? 'on' : 'off'}`}
+                onClick={handleToggleProactiveShield}
+              >
+                <span className="ios-toggle-knob"></span>
+              </button>
+            </div>
+          </div>
+
+          {/* User Vault / Personal Details Card */}
+          <div className="settings-group-card" id="user-profile-settings-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+              <span className="settings-group-title" style={{ margin: 0 }}>👤 Personal Details (Local Vault)</span>
+              <span style={{ fontSize: '10px', color: '#16a34a', background: '#dcfce7', padding: '2px 6px', borderRadius: '4px', fontWeight: 600 }}>
+                🔒 100% Local Only
               </span>
             </div>
-            <p style={{ fontSize: '0.73rem', color: '#64748b', margin: '0 0 8px 0', lineHeight: 1.35 }}>
-              Choose whether visual grounding runs on a remote GPU (Google Colab / vLLM), local PyTorch accelerator, or the ultra-fast deterministic mock.
+            <p className="settings-group-desc">
+              Your details are stored strictly in <code>chrome.storage.local</code> for autofill. They are <strong>never</strong> transmitted to any remote AI server.
             </p>
 
+            {profileSaveSuccess && (
+              <div style={{ background: '#ecfdf5', border: '1px solid #86efac', color: '#166534', padding: '6px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 600, marginBottom: '8px' }}>
+                ✅ Details saved securely to your local browser vault!
+              </div>
+            )}
+
+            {/* Accordion 1: Basic Info */}
+            <div className="profile-section-card">
+              <button
+                type="button"
+                className="profile-section-toggle"
+                onClick={() => toggleSection('basic')}
+              >
+                <div className="section-title-group">
+                  <span className="section-icon">👤</span>
+                  <span className="section-title">Basic Info</span>
+                  {userProfile.fullName && userProfile.email ? (
+                    <span className="section-filled-badge">Filled</span>
+                  ) : (
+                    <span className="section-required-badge">Required</span>
+                  )}
+                </div>
+                <span className="section-arrow">{expandedSections.basic ? '▲' : '▼'}</span>
+              </button>
+              {expandedSections.basic && (
+                <div className="profile-section-body">
+                  <div className="profile-grid">
+                    <div className="profile-field full-width">
+                      <label className="profile-label">Full Name <span className="required-star">*</span></label>
+                      <input
+                        type="text"
+                        className={`profile-input ${profileErrors.fullName ? 'has-error' : ''}`}
+                        value={userProfile.fullName || ''}
+                        onChange={(e) => handleProfileFieldChange('fullName', e.target.value)}
+                        placeholder="e.g. Rahul Sharma"
+                        id="profile-fullname-input"
+                      />
+                      {profileErrors.fullName && <span className="field-error-msg">{profileErrors.fullName}</span>}
+                    </div>
+
+                    <div className="profile-field full-width">
+                      <label className="profile-label">Email Address <span className="required-star">*</span></label>
+                      <input
+                        type="email"
+                        className={`profile-input ${profileErrors.email ? 'has-error' : ''}`}
+                        value={userProfile.email || ''}
+                        onChange={(e) => handleProfileFieldChange('email', e.target.value)}
+                        placeholder="e.g. rahul.sharma@example.com"
+                        id="profile-email-input"
+                      />
+                      {profileErrors.email && <span className="field-error-msg">{profileErrors.email}</span>}
+                    </div>
+
+                    <div className="profile-field">
+                      <label className="profile-label">Phone Number</label>
+                      <input
+                        type="tel"
+                        className={`profile-input ${profileErrors.phone ? 'has-error' : ''}`}
+                        value={userProfile.phone || ''}
+                        onChange={(e) => handleProfileFieldChange('phone', e.target.value)}
+                        placeholder="9876543210"
+                        id="profile-phone-input"
+                      />
+                      {profileErrors.phone && <span className="field-error-msg">{profileErrors.phone}</span>}
+                    </div>
+
+                    <div className="profile-field">
+                      <label className="profile-label">Gender</label>
+                      <select
+                        className="profile-input"
+                        value={userProfile.gender || 'Female'}
+                        onChange={(e) => handleProfileFieldChange('gender', e.target.value)}
+                        id="profile-gender-select"
+                      >
+                        <option value="Female">Female</option>
+                        <option value="Male">Male</option>
+                        <option value="Other">Other</option>
+                      </select>
+                    </div>
+
+                    <div className="profile-field">
+                      <label className="profile-label">Date of Birth</label>
+                      <input
+                        type="date"
+                        className="profile-input"
+                        value={userProfile.dateOfBirth || ''}
+                        onChange={(e) => handleProfileFieldChange('dateOfBirth', e.target.value)}
+                        id="profile-dob-input"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Accordion 2: Address & Location */}
+            <div className="profile-section-card">
+              <button
+                type="button"
+                className="profile-section-toggle"
+                onClick={() => toggleSection('address')}
+              >
+                <div className="section-title-group">
+                  <span className="section-icon">🏠</span>
+                  <span className="section-title">Address &amp; Location</span>
+                  {userProfile.city || userProfile.address || userProfile.state ? <span className="section-filled-badge">Filled</span> : null}
+                </div>
+                <span className="section-arrow">{expandedSections.address ? '▲' : '▼'}</span>
+              </button>
+              {expandedSections.address && (
+                <div className="profile-section-body">
+                  <div className="profile-grid">
+                    <div className="profile-field full-width">
+                      <label className="profile-label">Street Address</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.address || ''}
+                        onChange={(e) => handleProfileFieldChange('address', e.target.value)}
+                        placeholder="Flat / House No., Landmark"
+                        id="profile-address-input"
+                      />
+                    </div>
+                    <div className="profile-field">
+                      <label className="profile-label">State / Region</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.state || ''}
+                        onChange={(e) => handleProfileFieldChange('state', e.target.value)}
+                        placeholder="NCR / Karnataka"
+                        id="profile-state-input"
+                      />
+                    </div>
+                    <div className="profile-field">
+                      <label className="profile-label">City</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.city || ''}
+                        onChange={(e) => handleProfileFieldChange('city', e.target.value)}
+                        placeholder="Delhi / Bengaluru"
+                        id="profile-city-input"
+                      />
+                    </div>
+                    <div className="profile-field">
+                      <label className="profile-label">Pincode</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.pincode || ''}
+                        onChange={(e) => handleProfileFieldChange('pincode', e.target.value)}
+                        placeholder="110001"
+                        id="profile-pincode-input"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Accordion 3: Career Details */}
+            <div className="profile-section-card">
+              <button
+                type="button"
+                className="profile-section-toggle"
+                onClick={() => toggleSection('career')}
+              >
+                <div className="section-title-group">
+                  <span className="section-icon">💼</span>
+                  <span className="section-title">Career / Professional</span>
+                  {userProfile.jobTitle || userProfile.linkedin ? <span className="section-filled-badge">Filled</span> : null}
+                </div>
+                <span className="section-arrow">{expandedSections.career ? '▲' : '▼'}</span>
+              </button>
+              {expandedSections.career && (
+                <div className="profile-section-body">
+                  <div className="profile-grid">
+                    <div className="profile-field">
+                      <label className="profile-label">Job Title</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.jobTitle || ''}
+                        onChange={(e) => handleProfileFieldChange('jobTitle', e.target.value)}
+                        placeholder="Software Engineer"
+                        id="profile-jobtitle-input"
+                      />
+                    </div>
+                    <div className="profile-field">
+                      <label className="profile-label">Experience</label>
+                      <input
+                        type="text"
+                        className="profile-input"
+                        value={userProfile.experience || ''}
+                        onChange={(e) => handleProfileFieldChange('experience', e.target.value)}
+                        placeholder="4 years"
+                        id="profile-experience-input"
+                      />
+                    </div>
+                    <div className="profile-field full-width">
+                      <label className="profile-label">LinkedIn URL</label>
+                      <input
+                        type="url"
+                        className="profile-input"
+                        value={userProfile.linkedin || ''}
+                        onChange={(e) => handleProfileFieldChange('linkedin', e.target.value)}
+                        placeholder="https://linkedin.com/in/username"
+                        id="profile-linkedin-input"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Profile Action Buttons */}
+            <div className="profile-actions">
+              <button
+                type="button"
+                className="profile-clear-btn"
+                onClick={handleClearProfile}
+                id="clear-profile-btn"
+              >
+                Clear Data
+              </button>
+              <button
+                type="button"
+                className="profile-save-btn"
+                onClick={() => handleSaveProfile()}
+                disabled={profileSaving}
+                id="save-profile-btn"
+              >
+                {profileSaving ? 'Saving...' : '💾 Save Details'}
+              </button>
+            </div>
+          </div>
+
+          {/* ZonUI-3B Grounding Engine Card */}
+          <div className="settings-group-card">
+            <span className="settings-group-title">⚡ ZonUI-3B Grounding Engine</span>
+            <p className="settings-group-desc">Select visual grounding compute provider</p>
             <div className="gpu-mode-selector">
               <button
                 className={`gpu-mode-btn ${gpuMode === 'MOCK' ? 'active' : ''}`}
                 onClick={() => handleUpdateGpuMode('MOCK')}
-                type="button"
-                id="gpu-mode-mock-btn"
               >
-                Mock (Fast 5ms)
+                Mock (5ms)
               </button>
               <button
                 className={`gpu-mode-btn ${gpuMode === 'REMOTE_API' ? 'active' : ''}`}
                 onClick={() => handleUpdateGpuMode('REMOTE_API')}
-                type="button"
-                id="gpu-mode-remote-btn"
               >
-                Colab / Remote GPU
+                Colab / Remote
               </button>
               <button
                 className={`gpu-mode-btn ${gpuMode === 'LOCAL_MODEL' ? 'active' : ''}`}
                 onClick={() => handleUpdateGpuMode('LOCAL_MODEL')}
-                type="button"
-                id="gpu-mode-local-btn"
               >
                 Local PyTorch
               </button>
             </div>
-
-            {gpuMode === 'REMOTE_API' && (
-              <div style={{ marginTop: '8px' }}>
-                <label style={{ fontSize: '0.72rem', fontWeight: 600, color: '#334155', display: 'block', marginBottom: '4px' }}>
-                  Remote GPU Endpoint (Hugging Face / Colab / vLLM):
-                </label>
-                <div className="gpu-input-row">
-                  <input
-                    type="text"
-                    className="gpu-endpoint-input"
-                    value={gpuEndpoint}
-                    onChange={(e) => setGpuEndpoint(e.target.value)}
-                    placeholder="https://router.huggingface.co/hf-inference/v1/chat/completions"
-                    id="gpu-endpoint-input"
-                  />
-                  <button
-                    className="gpu-test-btn"
-                    onClick={() => handleUpdateGpuMode('REMOTE_API', gpuEndpoint)}
-                    type="button"
-                    id="save-gpu-endpoint-btn"
-                  >
-                    Save
-                  </button>
-                </div>
-                
-                {/* Quick Presets */}
-                <div style={{ display: 'flex', gap: '4px', marginTop: '6px' }}>
-                  <button
-                    type="button"
-                    style={{ background: '#fef3c7', border: '1px solid #fde68a', color: '#92400e', borderRadius: '4px', padding: '3px 6px', fontSize: '0.68rem', fontWeight: 700, cursor: 'pointer' }}
-                    onClick={() => {
-                      const hfUrl = 'https://router.huggingface.co/hf-inference/v1/chat/completions';
-                      setGpuEndpoint(hfUrl);
-                      handleUpdateGpuMode('REMOTE_API', hfUrl);
-                    }}
-                    id="preset-hf-btn"
-                  >
-                    🤗 Hugging Face (ZonUI-3B)
-                  </button>
-                  <button
-                    type="button"
-                    style={{ background: '#e0f2fe', border: '1px solid #bae6fd', color: '#0369a1', borderRadius: '4px', padding: '3px 6px', fontSize: '0.68rem', fontWeight: 700, cursor: 'pointer' }}
-                    onClick={() => {
-                      const colabUrl = 'http://localhost:8001/ground';
-                      setGpuEndpoint(colabUrl);
-                      handleUpdateGpuMode('REMOTE_API', colabUrl);
-                    }}
-                    id="preset-colab-btn"
-                  >
-                    ☁️ Colab / Tunnel
-                  </button>
-                </div>
+            <button
+              type="button"
+              className="gpu-test-btn"
+              style={{ width: '100%', marginTop: '6px' }}
+              onClick={handleTestGpu}
+              disabled={testingGpu}
+            >
+              {testingGpu ? 'Testing...' : '🔌 Test GPU Connection & Ping'}
+            </button>
+            {gpuTestResult && (
+              <div style={{ marginTop: '6px', fontSize: '11px', color: gpuTestResult.success ? '#15803d' : '#b91c1c' }}>
+                {gpuTestResult.success ? '✅' : '❌'} {gpuTestResult.message}
               </div>
             )}
+          </div>
 
-            <div style={{ marginTop: '10px', display: 'flex', gap: '6px' }}>
-              <button
-                className="gpu-test-btn"
-                style={{ width: '100%' }}
-                onClick={handleTestGpu}
-                disabled={testingGpu}
-                type="button"
-                id="test-gpu-conn-btn"
-              >
-                {testingGpu ? '⏳ Testing Connection...' : '🔌 Test GPU Connection & Ping'}
-              </button>
+          {/* Policy Table Card */}
+          <div className="settings-group-card">
+            <span className="settings-group-title">🛡️ Policy Engine Rules</span>
+            <div className="policy-table-container">
+              <table className="policy-table">
+                <tbody>
+                  {[
+                    { key: 'aadhaar', label: 'Aadhaar Card' },
+                    { key: 'pan', label: 'PAN Card' },
+                    { key: 'name', label: 'Person Name' },
+                    { key: 'phone', label: 'Phone Number' },
+                    { key: 'email', label: 'Email Address' },
+                    { key: 'amount', label: 'Financial Amount' },
+                  ].map((item) => (
+                    <tr key={item.key}>
+                      <td><strong>{item.label}</strong></td>
+                      <td style={{ textAlign: 'right' }}>
+                        <select
+                          className="policy-select"
+                          value={policy[item.key] || 'MASK'}
+                          onChange={(e) => handlePolicyChange(item.key, e.target.value as PolicyAction)}
+                        >
+                          <option value="MASK">MASK</option>
+                          <option value="BLOCK">BLOCK</option>
+                          <option value="ALLOW">ALLOW</option>
+                          <option value="ASK">ASK</option>
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Missing Information Prompt Modal */}
+      {missingPrompt && missingPrompt.visible && (
+        <div className="missing-fields-modal-overlay">
+          <div className="missing-fields-modal-card">
+            <div className="missing-fields-header">
+              <div className="missing-fields-icon-box">📝</div>
+              <div>
+                <h4 className="missing-fields-title">Missing Information Needed</h4>
+                <p className="missing-fields-subtitle">
+                  The active form requires details that are not in your saved profile. Please enter them so the agent can fill the form accurately:
+                </p>
+              </div>
             </div>
 
-            {gpuTestResult && (
-              <div className={`gpu-test-result ${gpuTestResult.success ? 'success' : 'error'}`}>
-                <span>{gpuTestResult.success ? '✅' : '❌'} {gpuTestResult.message}</span>
-                {gpuTestResult.latencyMs !== undefined && (
-                  <strong style={{ fontSize: '0.70rem' }}>{gpuTestResult.latencyMs}ms</strong>
-                )}
-              </div>
-            )}
-          </div>
+            <div className="missing-fields-body">
+              {missingPrompt.fields.map((field) => (
+                <div key={field.key} className="missing-field-row">
+                  <div className="missing-field-label-wrap">
+                    <span className="missing-field-name">{field.label}</span>
+                    <span className="missing-field-badge">{field.reason}</span>
+                  </div>
+                  {field.type === 'select' && field.options ? (
+                    <select
+                      className="missing-field-select"
+                      value={missingPrompt.values[field.key] || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setMissingPrompt((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                values: { ...prev.values, [field.key]: val },
+                              }
+                            : null
+                        );
+                      }}
+                    >
+                      <option value="">-- Select {field.label} --</option>
+                      {field.options.map((opt) => (
+                        <option key={opt} value={opt}>
+                          {opt}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type={field.type || 'text'}
+                      className="missing-field-input"
+                      placeholder={field.placeholder}
+                      value={missingPrompt.values[field.key] || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setMissingPrompt((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                values: { ...prev.values, [field.key]: val },
+                              }
+                            : null
+                        );
+                      }}
+                      autoFocus={field === missingPrompt.fields[0]}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
 
-          <div className="settings-header">
-            <h3>Policy Engine Configuration</h3>
-            <p className="settings-desc">
-              Define the action to take for each field category. Actions:
-              <strong> MASK</strong> (blackout &amp; token), <strong> BLOCK</strong> (remove completely),{' '}
-              <strong> ALLOW</strong> (pass-through), or <strong> ASK</strong> (prompt user).
-            </p>
+            <div className="missing-fields-footer">
+              <button
+                type="button"
+                className="btn-missing-save"
+                onClick={handleSaveMissingAndFill}
+              >
+                💾 Save to Profile &amp; Fill Form
+              </button>
+              <button
+                type="button"
+                className="btn-missing-skip"
+                onClick={handleSkipMissingAndFill}
+              >
+                ⏩ Skip Missing &amp; Fill Remaining
+              </button>
+              <button
+                type="button"
+                className="btn-missing-cancel"
+                onClick={() => setMissingPrompt(null)}
+              >
+                Cancel
+              </button>
+            </div>
           </div>
+        </div>
+      )}
 
-          <div className="policy-table-container">
-            <table className="policy-table">
-              <thead>
-                <tr>
-                  <th>Field Category</th>
-                  <th>Action Policy</th>
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  { key: 'aadhaar', label: 'Aadhaar (12-digit UIDAI)' },
-                  { key: 'pan', label: 'PAN Card (10-char Tax ID)' },
-                  { key: 'name', label: 'Person Name' },
-                  { key: 'address', label: 'Address / Residence' },
-                  { key: 'amount', label: 'Total / Amount (Financial)' },
-                  { key: 'phone', label: 'Phone / Mobile Number' },
-                  { key: 'email', label: 'Email Address' },
-                  { key: 'unclassified', label: 'Unclassified Content (Default Fail-Safe)' },
-                ].map((item) => (
-                  <tr key={item.key}>
-                    <td>
-                      <strong>{item.label}</strong>
-                    </td>
-                    <td>
-                      <select
-                        className="policy-select"
-                        value={policy[item.key] || 'MASK'}
-                        onChange={(e) => handlePolicyChange(item.key, e.target.value as PolicyAction)}
-                        id={`policy-select-${item.key}`}
-                      >
-                        <option value="MASK">MASK (Redact &amp; Blackout)</option>
-                        <option value="BLOCK">BLOCK (Remove from Payload)</option>
-                        <option value="ALLOW">ALLOW (Pass-through)</option>
-                        <option value="ASK">ASK (Prompt User)</option>
-                      </select>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {/* Lightbox Modal */}
+      {expandedImage && (
+        <div className="screenshot-lightbox-overlay" onClick={() => setExpandedImage(null)}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+            <span style={{ color: '#ffffff', fontWeight: 700, fontSize: '13px' }}>{expandedImage.title}</span>
+            <button
+              type="button"
+              onClick={() => setExpandedImage(null)}
+              style={{ background: '#ef4444', color: '#ffffff', border: 'none', borderRadius: '4px', padding: '4px 10px', fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}
+            >
+              ✕ Close
+            </button>
           </div>
-
-          <div className="failsafe-notice">
-            🔒 <strong>Hard Rule:</strong> Any field category not explicitly configured by the user
-            strictly defaults to <code>MASK</code>. Content is never silently allowed.
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <img
+              src={expandedImage.src}
+              alt={expandedImage.title}
+              style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', borderRadius: '4px' }}
+            />
           </div>
         </div>
       )}

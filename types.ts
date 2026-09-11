@@ -22,11 +22,18 @@ export interface DomNode {
   boundingBox: BoundingBox;
 }
 
+export interface ViewportInfo {
+  width: number;
+  height: number;
+  dpr: number;
+}
+
 export interface RawContext {
   url: string;
   timestamp: number;
   dom: DomNode[];
   screenshot: string;
+  viewport?: ViewportInfo;
 }
 
 export interface VisualRegion {
@@ -131,6 +138,7 @@ export interface AuditLogEntry {
   bbox: { x: number; y: number; width: number; height: number };
   timestamp: number;
   details?: string;
+  domId?: string;
 }
 
 export interface SafeContext {
@@ -222,6 +230,27 @@ export interface ExecutionReport {
   success: boolean;
 }
 
+export type AgentSessionStatus =
+  | 'IDLE'
+  | 'STARTING'
+  | 'PROTECTING'
+  | 'PLANNING'
+  | 'EXECUTING'
+  | 'COMPLETED'
+  | 'ERROR';
+
+export interface AgentSession {
+  sessionId: string;
+  tabId: number;
+  status: AgentSessionStatus;
+  startedAt: number;
+  completedAt?: number;
+  taskPrompt?: string;
+  url?: string;
+  plan?: PlanResponse;
+  executionReport?: ExecutionReport;
+}
+
 export type MessageRequest =
   | { type: 'GET_CONTEXT' }
   | { type: 'CAPTURE_SCREEN'; windowId?: number }
@@ -229,6 +258,66 @@ export type MessageRequest =
       type: 'EXECUTE_PLAN';
       actions: PlanAction[];
       safeContextAuditLog?: AuditLogEntry[];
-    };
+    }
+  | { type: 'START_AGENT_SESSION'; tabId: number; taskPrompt?: string }
+  | { type: 'STOP_AGENT_SESSION'; tabId?: number }
+  | { type: 'GET_SESSION_STATE' }
+  | {
+      type: 'UPDATE_SESSION_STATUS';
+      status: AgentSessionStatus;
+      plan?: PlanResponse;
+      executionReport?: ExecutionReport;
+    }
+  | { type: 'SESSION_ACTIVATED'; session: AgentSession }
+  | { type: 'SESSION_DEACTIVATED' };
+
+/**
+ * Secure Local User Profile
+ * Stored strictly in chrome.storage.local. NEVER transmitted to ZonUI or any remote server.
+ */
+export interface UserProfile {
+  // 1. 👤 Basic Details
+  fullName: string;
+  firstName?: string;
+  lastName?: string;
+  email: string;
+  phone: string;
+  dateOfBirth: string;
+  gender: string;
+
+  // 2. 🏠 Address Details
+  address: string;
+  city: string;
+  state: string;
+  pincode: string;
+  country?: string;
+
+  // 3. 💼 Career Details
+  jobTitle?: string;
+  experience?: string;
+  education?: string;
+  college?: string;
+  linkedin?: string;
+  portfolio?: string;
+
+  // 4. ✈️ Travel Preferences
+  defaultOrigin?: string;
+  defaultDestination?: string;
+  berthPreference?: string;
+  foodPreference?: string;
+
+  updatedAt?: number;
+  [key: string]: string | number | undefined;
+}
+
+export interface MissingFieldItem {
+  key: keyof UserProfile;
+  label: string;
+  placeholder: string;
+  type?: 'text' | 'email' | 'tel' | 'date' | 'select';
+  options?: string[];
+  reason: string;
+}
+
 
 

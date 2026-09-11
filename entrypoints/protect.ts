@@ -196,7 +196,8 @@ export async function redactScreenshot(
           ctx.fillStyle = '#f8fafc';
           ctx.font = `bold ${Math.max(10, Math.min(13, Math.floor(h * 0.45)))}px Arial, sans-serif`;
           ctx.textBaseline = 'middle';
-          ctx.fillText(`🛡️ [REDACTED: ${target.piiType}]`, x + 8, y + h / 2);
+          const displayType = String(target.piiType || '').toUpperCase().replace('_', ' ');
+          ctx.fillText(`🛡️ ${displayType}`, x + 8, y + h / 2);
         }
 
         resolve(canvas.toDataURL('image/png'));

@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import logging
+import re
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

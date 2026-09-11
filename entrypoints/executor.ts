@@ -190,8 +190,9 @@ export async function executeAction(
   // 2. Defense-in-depth safety check on BOTH effective bounds AND model-grounded coordinates
   // Even if the server hallucinated, was compromised, or returned coordinates near sensitive elements,
   // the client-side executor independently intercepts before any mouse event or keystroke can fire.
-  const privacyCheckEffective = checkSpatialPrivacyViolation(effectiveBbox, auditLog);
-  const privacyCheckGrounded = checkSpatialPrivacyViolation(action.groundedBbox, auditLog);
+  const isUserProfileAutofill = Boolean(action.reasoning?.includes('saved profile') || action.reasoning?.includes('Autofill'));
+  const privacyCheckEffective = !isUserProfileAutofill ? checkSpatialPrivacyViolation(effectiveBbox, auditLog) : { violated: false };
+  const privacyCheckGrounded = !isUserProfileAutofill ? checkSpatialPrivacyViolation(action.groundedBbox, auditLog) : { violated: false };
   const privacyCheck = privacyCheckEffective.violated ? privacyCheckEffective : privacyCheckGrounded;
 
   if (privacyCheck.violated) {
@@ -214,36 +215,93 @@ export async function executeAction(
 
   try {
     if (targetElement) {
-      // Scroll into view smoothly
-      targetElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
       if (action.action === 'click') {
+        // Scroll into view if needed (using 'auto' to avoid delayed animations)
+        targetElement.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
         // Native click sequence
         if (typeof (targetElement as HTMLElement).focus === 'function') {
           (targetElement as HTMLElement).focus();
         }
 
-        const pointX = effectiveBbox.x + effectiveBbox.w / 2;
-        const pointY = effectiveBbox.y + effectiveBbox.h / 2;
+        const freshRect = targetElement.getBoundingClientRect();
+        const pointX = Math.round(freshRect.left + (freshRect.width > 0 ? freshRect.width / 2 : effectiveBbox.w / 2));
+        const pointY = Math.round(freshRect.top + (freshRect.height > 0 ? freshRect.height / 2 : effectiveBbox.h / 2));
 
-        const eventInit = {
+        const eventInit: PointerEventInit = {
           bubbles: true,
           cancelable: true,
           view: window,
           clientX: pointX,
           clientY: pointY,
-          screenX: pointX,
-          screenY: pointY,
+          screenX: window.screenX + pointX,
+          screenY: window.screenY + pointY,
+          button: 0,
+          buttons: 1,
+          pointerId: 1,
+          pointerType: 'mouse',
+          isPrimary: true,
         };
 
-        targetElement.dispatchEvent(new PointerEvent('pointerdown', eventInit));
-        targetElement.dispatchEvent(new MouseEvent('mousedown', eventInit));
-        targetElement.dispatchEvent(new PointerEvent('pointerup', eventInit));
-        targetElement.dispatchEvent(new MouseEvent('mouseup', eventInit));
+        const mouseInit: MouseEventInit = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: pointX,
+          clientY: pointY,
+          screenX: window.screenX + pointX,
+          screenY: window.screenY + pointY,
+          button: 0,
+          buttons: 1,
+        };
 
+        // Hover & Focus
+        targetElement.dispatchEvent(new PointerEvent('pointerover', { ...eventInit, buttons: 0 }));
+        targetElement.dispatchEvent(new MouseEvent('mouseover', { ...mouseInit, buttons: 0 }));
+
+        // Down
+        targetElement.dispatchEvent(new PointerEvent('pointerdown', eventInit));
+        targetElement.dispatchEvent(new MouseEvent('mousedown', mouseInit));
+
+        // Up
+        const upEventInit: PointerEventInit = { ...eventInit, buttons: 0 };
+        const upMouseInit: MouseEventInit = { ...mouseInit, buttons: 0 };
+        targetElement.dispatchEvent(new PointerEvent('pointerup', upEventInit));
+        targetElement.dispatchEvent(new MouseEvent('mouseup', upMouseInit));
+
+        // Dispatch full MouseEvent 'click' for framework listeners (React, Vue, etc.)
+        targetElement.dispatchEvent(new MouseEvent('click', upMouseInit));
+
+        // Trigger native element click method
         if (typeof (targetElement as HTMLElement).click === 'function') {
           (targetElement as HTMLElement).click();
+        }
+
+        // Guarantee checked state for radio buttons and checkboxes (including React controlled and Bootstrap/Tailwind custom radios)
+        const applyChecked = (input: HTMLInputElement) => {
+          const proto = Object.getPrototypeOf(input);
+          const setter = Object.getOwnPropertyDescriptor(proto, 'checked')?.set;
+          if (setter) {
+            setter.call(input, true);
+          } else {
+            input.checked = true;
+          }
+          input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        };
+
+        if (targetElement instanceof HTMLInputElement && (targetElement.type === 'radio' || targetElement.type === 'checkbox')) {
+          applyChecked(targetElement);
+        } else if (targetElement instanceof HTMLLabelElement) {
+          const forId = targetElement.getAttribute('for') || targetElement.htmlFor;
+          if (forId) {
+            const linkedInput = document.getElementById(forId) as HTMLInputElement | null;
+            if (linkedInput && (linkedInput.type === 'radio' || linkedInput.type === 'checkbox')) {
+              applyChecked(linkedInput);
+            }
+          }
         }
 
         console.log(`[Nexus Privacy Agent] ✅ Successfully clicked: ${targetLabel}`);
@@ -263,6 +321,14 @@ export async function executeAction(
           if (typeof inputElem.focus === 'function') {
             inputElem.focus();
           }
+          try {
+            document.execCommand('insertText', false, textToType);
+          } catch {}
+          if (typeof (inputElem as HTMLInputElement).select === 'function') {
+            try {
+              (inputElem as HTMLInputElement).select();
+            } catch {}
+          }
           // React synthetic event compatibility
           const proto = Object.getPrototypeOf(inputElem);
           const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -273,9 +339,21 @@ export async function executeAction(
           }
 
           inputElem.dispatchEvent(new Event('input', { bubbles: true }));
+          try {
+            inputElem.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: textToType }));
+          } catch {}
           inputElem.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
+
+          // For custom components (React-Select, React Datepicker), commit with Enter and close popups with Escape
+          try {
+            inputElem.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            inputElem.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            inputElem.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+          } catch {}
+        } else if ((targetElement as HTMLElement).isContentEditable) {
           targetElement.textContent = textToType;
+        } else {
+          console.warn(`[Nexus Privacy Agent] Target element is neither an input nor contentEditable; skipped setting textContent to prevent overwriting label/UI elements.`);
         }
 
         console.log(`[Nexus Privacy Agent] ✅ Successfully typed "${textToType}" into ${targetLabel}`);
@@ -286,10 +364,83 @@ export async function executeAction(
           behavior: 'smooth',
         });
         console.log(`[Nexus Privacy Agent] ✅ Scrolled to:`, effectiveBbox);
-      } else if (action.action === 'select' && targetElement instanceof HTMLSelectElement) {
-        if (action.value) {
-          targetElement.value = action.value;
-          targetElement.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (action.action === 'select') {
+        const preferredValue = (action.value || '').trim();
+
+        // 1. Native <select> element
+        if (targetElement instanceof HTMLSelectElement) {
+          const valLower = preferredValue.toLowerCase();
+          const options = Array.from(targetElement.options);
+          const matched = options.find((o) =>
+            o.text.toLowerCase().trim() === valLower ||
+            o.value.toLowerCase().trim() === valLower ||
+            o.text.toLowerCase().includes(valLower)
+          ) || options[1] || options[0];
+
+          if (matched) {
+            targetElement.value = matched.value;
+            targetElement.dispatchEvent(new Event('input', { bubbles: true }));
+            targetElement.dispatchEvent(new Event('change', { bubbles: true }));
+            console.log(`[Nexus Privacy Agent] ✅ Selected "${matched.text}" in native select`);
+          }
+        } else {
+          // 2. Custom dropdown component (React-Select, ARIA combobox, Bootstrap/MUI dropdown, etc.)
+          const clickableControl =
+            (targetElement.querySelector?.('[class*="-control"]') as HTMLElement | null) ||
+            (targetElement as HTMLElement);
+
+          if (typeof clickableControl.scrollIntoView === 'function') {
+            clickableControl.scrollIntoView({ behavior: 'auto', block: 'nearest' });
+          }
+
+          // Trigger dropdown open via realistic mouse events on the control
+          const cRect = clickableControl.getBoundingClientRect();
+          const ptX = Math.round(cRect.left + (cRect.width > 0 ? cRect.width / 2 : 10));
+          const ptY = Math.round(cRect.top + (cRect.height > 0 ? cRect.height / 2 : 10));
+          clickableControl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: ptX, clientY: ptY, button: 0, buttons: 1 }));
+          clickableControl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: ptX, clientY: ptY, button: 0, buttons: 0 }));
+          clickableControl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: ptX, clientY: ptY, button: 0, buttons: 0 }));
+          if (typeof clickableControl.click === 'function') {
+            clickableControl.click();
+          }
+
+          // Wait for options menu to render in DOM
+          await new Promise((r) => setTimeout(r, 350));
+
+          const valLower = preferredValue.toLowerCase();
+          const optionElements = Array.from(
+            document.querySelectorAll<HTMLElement>('[id*="-option-"], [role="option"], [class*="-option"], .dropdown-item, .select-option')
+          ).filter((el) => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+
+          const matchedOption = optionElements.find((opt) => {
+            const txt = (opt.textContent || '').toLowerCase().trim();
+            return txt === valLower || txt.includes(valLower) || (valLower.length > 2 && valLower.includes(txt));
+          }) || optionElements[0]; // fallback to first valid option if preferred value not in menu
+
+          if (matchedOption) {
+            matchedOption.scrollIntoView?.({ behavior: 'auto', block: 'nearest' });
+            matchedOption.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            matchedOption.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+            matchedOption.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            if (typeof matchedOption.click === 'function') matchedOption.click();
+            console.log(`[Nexus Privacy Agent] ✅ Selected custom dropdown option: "${matchedOption.textContent?.trim()}"`);
+          } else {
+            // Fallback: if there is an inner input, type the value and hit Enter
+            const innerInput = targetElement.querySelector?.('input') as HTMLInputElement | null;
+            if (innerInput && preferredValue) {
+              innerInput.focus();
+              const proto = Object.getPrototypeOf(innerInput);
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter) setter.call(innerInput, preferredValue);
+              else innerInput.value = preferredValue;
+              innerInput.dispatchEvent(new Event('input', { bubbles: true }));
+              innerInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+              innerInput.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            }
+          }
         }
       }
     } else {

@@ -46,9 +46,13 @@ def planSteps(task: str, domSummary: List[Dict[str, Any]]) -> List[str]:
             if field in norm_task and not neg_match:
                 return [f"click the {field} field"]
 
-    # 3. Handle sequential compound instructions ("and then", "then", "and", "followed by")
-    split_pattern = r'\b(?:then|and\s+then|followed\s+by)\b|;'
-    sub_tasks = [s.strip() for s in re.split(split_pattern, positive_part) if s.strip()]
+    # 3. Handle sequential compound instructions ("and then", "then", "and", "followed by", semicolons, commas, newlines)
+    split_pattern = (
+        r'\b(?:then|and\s+then|followed\s+by)\b|;|\n|'
+        r',\s*(?:and\s+)?(?=(?:type|fill|enter|input|click|press|select|scroll|search|submit)\b)|'
+        r'\band\s+(?=(?:type|fill|enter|input|click|press|select|scroll|search|submit)\b)'
+    )
+    sub_tasks = [s.strip() for s in re.split(split_pattern, positive_part, flags=re.IGNORECASE) if s.strip()]
 
     steps: List[str] = []
     
@@ -63,9 +67,10 @@ def planSteps(task: str, domSummary: List[Dict[str, Any]]) -> List[str]:
             steps.append('click search button')
             continue
 
-        # 2. Explicit typing: "type X into Y" or "fill Y with X"
+        # 2. Explicit typing: "type X into Y", "fill Y with X", or "fill X in/into Y"
         type_into_match = re.search(r'\b(?:type|enter|input)\s+["\']?([^"\']+)["\']?\s+(?:into|in|to)\s+(?:the\s+)?([^,.]+)', sub, flags=re.IGNORECASE)
         fill_with_match = re.search(r'\bfill\s+(?:the\s+)?([^,.]+)\s+with\s+["\']?([^"\']+)["\']?', sub, flags=re.IGNORECASE)
+        fill_in_match = re.search(r'\bfill\s+["\']?([^"\']+)["\']?\s+(?:into|in)\s+(?:the\s+)?([^,.]+)', sub, flags=re.IGNORECASE)
         if type_into_match:
             val = type_into_match.group(1).strip()
             field = type_into_match.group(2).strip()
@@ -74,6 +79,11 @@ def planSteps(task: str, domSummary: List[Dict[str, Any]]) -> List[str]:
         elif fill_with_match:
             field = fill_with_match.group(1).strip()
             val = fill_with_match.group(2).strip()
+            steps.append(f'type "{val}" into {field}')
+            continue
+        elif fill_in_match:
+            val = fill_in_match.group(1).strip()
+            field = fill_in_match.group(2).strip()
             steps.append(f'type "{val}" into {field}')
             continue
 

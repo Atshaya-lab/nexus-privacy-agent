@@ -4,49 +4,75 @@ import { detectPii } from './pii-detect';
 import { getPolicy, resolvePolicyAction, DEFAULT_POLICY } from './policy';
 
 export function extractDom(): DomNode[] {
-  const selector = 'input, button, a, select, textarea, [role], label, h1, h2, h3, p, canvas';
+  const selector = 'input, button, a, select, textarea, [role], label, h1, h2, h3, p, canvas, #state, #city, #subjectsContainer';
   const elements = document.querySelectorAll(selector);
   const nodes: DomNode[] = [];
 
   const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
   const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+  const scrollBuffer = 400;
 
+  let nodeCounter = 0;
   for (const el of elements) {
     // Ignore internal privacy overlays
-    if (el.closest('#nexus-page-privacy-container') || el.closest('#nexus-privacy-badge')) {
-      continue;
-    }
-
-    const rect = el.getBoundingClientRect();
-    // Skip elements with zero width or zero height (hidden elements)
-    if (rect.width <= 0 || rect.height <= 0) {
-      continue;
-    }
-
-    // Skip elements outside the current viewport bounds
     if (
-      rect.bottom <= 0 ||
-      rect.top >= viewportHeight ||
-      rect.right <= 0 ||
-      rect.left >= viewportWidth
+      el.closest('#nexus-page-privacy-container') ||
+      el.closest('#nexus-privacy-badge') ||
+      el.closest('#nexus-agent-execution-overlay')
     ) {
       continue;
     }
 
     const tag = el.tagName.toLowerCase();
+    const isFormControl =
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement ||
+      el instanceof HTMLButtonElement ||
+      tag === 'label' ||
+      el.id === 'state' ||
+      el.id === 'city' ||
+      el.id === 'subjectsContainer';
+
+    const rect = el.getBoundingClientRect();
+    // Skip non-form elements with zero dimensions
+    if (!isFormControl && (rect.width <= 0 || rect.height <= 0)) {
+      continue;
+    }
+
+    // Skip non-form elements outside current viewport bounds
+    if (
+      !isFormControl &&
+      (rect.bottom < -scrollBuffer ||
+      rect.top > viewportHeight + scrollBuffer ||
+      rect.right < 0 ||
+      rect.left > viewportWidth)
+    ) {
+      continue;
+    }
+
     const role = el.getAttribute('role');
+
+    // Assign / retrieve unique persistent ID for tracking
+    let domId = (el as HTMLElement).dataset.nexusDomId;
+    if (!domId) {
+      domId = `nexus-node-${++nodeCounter}`;
+      (el as HTMLElement).dataset.nexusDomId = domId;
+    }
 
     // Trimmed text content (max 200 chars)
     let rawText = '';
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-      rawText = el.value || el.placeholder || el.getAttribute('aria-label') || '';
+      rawText = el.value || '';
     } else {
       rawText = el.textContent || '';
     }
     const text = rawText.trim().replace(/\s+/g, ' ').slice(0, 200);
 
     // Relevant attrs (id, name, type)
-    const attributes: DomNode['attributes'] = {};
+    const attributes: DomNode['attributes'] = {
+      'data-nexus-dom-id': domId,
+    };
     const id = el.getAttribute('id');
     if (id) attributes.id = id;
 
@@ -67,6 +93,62 @@ export function extractDom(): DomNode[] {
 
     const className = el.getAttribute('class');
     if (className) attributes['class'] = className;
+
+    const htmlFor = el.getAttribute('for');
+    if (htmlFor) attributes['for'] = htmlFor;
+
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+      if (el.value && el.value.trim().length > 0) {
+        attributes.value = el.value;
+      }
+    }
+
+    // Detect associated label for form controls so inputs inherit their label context
+    if (
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLTextAreaElement ||
+      el instanceof HTMLSelectElement
+    ) {
+      let associatedLabel = '';
+      if ((el as any).labels && (el as any).labels.length > 0) {
+        associatedLabel = Array.from((el as any).labels as HTMLLabelElement[])
+          .map((l) => l.textContent || '')
+          .join(' ')
+          .trim();
+      }
+      if (!associatedLabel && id) {
+        try {
+          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+          if (lbl) associatedLabel = (lbl.textContent || '').trim();
+        } catch {}
+      }
+      if (!associatedLabel) {
+        // Walk up ancestors checking for container row/form-group labels
+        let parent: HTMLElement | null = el.parentElement;
+        let depth = 0;
+        while (parent && parent !== document.body && depth < 5 && !associatedLabel) {
+          const rowLbl = parent.querySelector('label');
+          if (rowLbl && rowLbl !== (el as HTMLElement) && !rowLbl.contains(el)) {
+            associatedLabel = (rowLbl.textContent || '').trim();
+            break;
+          }
+          parent = parent.parentElement;
+          depth++;
+        }
+      }
+      if (!associatedLabel) {
+        let prev = el.previousElementSibling;
+        while (prev && !associatedLabel) {
+          if (prev.tagName.toLowerCase() === 'label' || prev.getAttribute('role') === 'label') {
+            associatedLabel = (prev.textContent || '').trim();
+          }
+          prev = prev.previousElementSibling;
+        }
+      }
+      if (associatedLabel) {
+        attributes.label = associatedLabel.replace(/\s+/g, ' ').slice(0, 100);
+      }
+    }
 
     nodes.push({
       tag,
@@ -91,55 +173,202 @@ export function injectPrivacyStyles() {
     style.id = 'nexus-privacy-injected-styles';
     style.textContent = `
       .nexus-privacy-shielded {
-        filter: blur(7px) !important;
-        background-color: #090d16 !important;
+        filter: blur(8px) !important;
+        background-color: #05070e !important;
         color: transparent !important;
         caret-color: transparent !important;
-        text-shadow: 0 0 8px rgba(255, 255, 255, 0.3) !important;
+        text-shadow: 0 0 10px rgba(255, 255, 255, 0.2) !important;
         border: 2px solid #ef4444 !important;
         border-radius: 4px !important;
-        transition: filter 0.2s ease !important;
+        user-select: none !important;
+        transition: none !important;
+      }
+      #nexus-page-privacy-container {
+        position: absolute !important;
+        top: 0 !important;
+        left: 0 !important;
+        width: 100% !important;
+        pointer-events: none !important;
+        z-index: 2147483640 !important;
+        overflow: visible !important;
+      }
+      .nexus-privacy-mask-box {
+        position: absolute !important;
+        background-color: #05070e !important;
+        border-radius: 4px !important;
+        box-shadow: 0 2px 10px rgba(239, 68, 68, 0.5) !important;
+        box-sizing: border-box !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: flex-start !important;
+        padding: 0 6px !important;
+        overflow: hidden !important;
+        pointer-events: none !important;
+        z-index: 2147483641 !important;
+        transition: none !important;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
 }
 
+interface TrackedMaskItem {
+  box: HTMLDivElement;
+  targetEl?: HTMLElement | null;
+  offsetX: number;
+  offsetY: number;
+  width: number;
+  height: number;
+  docX: number;
+  docY: number;
+}
+
+let activeTrackedMasks: TrackedMaskItem[] = [];
+let scrollRafId: number | null = null;
+let isScrollListenerAttached = false;
+
+function syncTrackedMaskPositions() {
+  if (!activeTrackedMasks.length) return;
+
+  const bodyEl = document.body || document.documentElement;
+  const bodyRect = bodyEl.getBoundingClientRect();
+
+  // Keep container height matched to document height
+  const container = document.getElementById('nexus-page-privacy-container');
+  if (container) {
+    const docHeight = Math.max(
+      document.documentElement.scrollHeight,
+      document.body?.scrollHeight || 0,
+      document.documentElement.clientHeight
+    );
+    container.style.height = `${docHeight}px`;
+  }
+
+  for (const item of activeTrackedMasks) {
+    if (item.targetEl && item.targetEl.isConnected) {
+      const elRect = item.targetEl.getBoundingClientRect();
+      const newDocX = Math.round(elRect.left - bodyRect.left + item.offsetX);
+      const newDocY = Math.round(elRect.top - bodyRect.top + item.offsetY);
+      item.box.style.left = `${Math.max(0, newDocX)}px`;
+      item.box.style.top = `${Math.max(0, newDocY)}px`;
+
+      if (item.targetEl.tagName.toLowerCase() !== 'canvas') {
+        item.box.style.width = `${Math.max(20, Math.round(elRect.width))}px`;
+        item.box.style.height = `${Math.max(16, Math.round(elRect.height))}px`;
+      }
+    }
+  }
+}
+
+function attachScrollTracker() {
+  if (isScrollListenerAttached) return;
+  isScrollListenerAttached = true;
+
+  const onScrollOrResize = () => {
+    if (scrollRafId) return;
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = null;
+      syncTrackedMaskPositions();
+    });
+  };
+
+  window.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
+  window.addEventListener('resize', onScrollOrResize, { passive: true });
+}
+
 export function renderPagePrivacyMasks(
-  masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string; elementSelector?: string }>
+  masks: Array<{
+    bbox: { x: number; y: number; width: number; height: number };
+    category: string;
+    action: string;
+    elementSelector?: string;
+    domId?: string;
+  }>
 ) {
   injectPrivacyStyles();
-
-  let container = document.getElementById('nexus-page-privacy-container');
-  if (container) {
-    container.remove();
-  }
-
-  let badge = document.getElementById('nexus-privacy-badge');
-  if (badge) {
-    badge.remove();
-  }
+  clearPagePrivacyMasks();
 
   if (!masks || masks.length === 0) return;
 
-  container = document.createElement('div');
+  const bodyEl = document.body || document.documentElement;
+  const bodyRect = bodyEl.getBoundingClientRect();
+
+  const container = document.createElement('div');
   container.id = 'nexus-page-privacy-container';
-  container.style.position = 'fixed';
+  container.style.position = 'absolute';
   container.style.top = '0';
   container.style.left = '0';
-  container.style.width = '100vw';
-  container.style.height = '100vh';
+  container.style.width = '100%';
+  const docHeight = Math.max(
+    document.documentElement.scrollHeight,
+    document.body?.scrollHeight || 0,
+    document.documentElement.clientHeight
+  );
+  container.style.height = `${docHeight}px`;
   container.style.pointerEvents = 'none';
   container.style.zIndex = '2147483640';
   container.style.fontFamily = 'system-ui, -apple-system, sans-serif';
 
+  activeTrackedMasks = [];
+
   for (const item of masks) {
+    // 1. Locate the exact DOM element (or canvas)
+    let targetEl: HTMLElement | null = null;
+    if (item.domId) {
+      targetEl = document.querySelector(`[data-nexus-dom-id="${item.domId}"]`);
+    }
+    if (!targetEl && item.elementSelector) {
+      try {
+        targetEl = document.querySelector(item.elementSelector);
+      } catch {}
+    }
+    if (!targetEl) {
+      const midX = item.bbox.x + item.bbox.width / 2;
+      const midY = item.bbox.y + item.bbox.height / 2;
+      const found = document.elementFromPoint(midX, midY);
+      if (found && found !== document.body && found !== document.documentElement) {
+        if (!found.closest('#nexus-page-privacy-container') && !found.closest('#nexus-privacy-badge')) {
+          targetEl = found as HTMLElement;
+        }
+      }
+    }
+
+    // 2. Direct Element Shielding: Apply blackout/blur directly to DOM node
+    if (targetEl && targetEl.tagName.toLowerCase() !== 'canvas') {
+      targetEl.classList.add('nexus-privacy-shielded');
+    }
+
+    // 3. Coordinate calculation in document-relative space
+    let offsetX = 0;
+    let offsetY = 0;
+    let width = item.bbox.width;
+    let height = item.bbox.height;
+    let docX = item.bbox.x - bodyRect.left;
+    let docY = item.bbox.y - bodyRect.top;
+
+    if (targetEl) {
+      const elRect = targetEl.getBoundingClientRect();
+      if (targetEl.tagName.toLowerCase() === 'canvas') {
+        offsetX = item.bbox.x - elRect.left;
+        offsetY = item.bbox.y - elRect.top;
+      } else {
+        offsetX = 0;
+        offsetY = 0;
+        width = Math.max(item.bbox.width, elRect.width);
+        height = Math.max(item.bbox.height, elRect.height);
+      }
+      docX = elRect.left - bodyRect.left + offsetX;
+      docY = elRect.top - bodyRect.top + offsetY;
+    }
+
+    // 4. Create document-relative blackout box
     const box = document.createElement('div');
-    box.style.position = 'fixed';
-    box.style.left = `${Math.max(0, item.bbox.x)}px`;
-    box.style.top = `${Math.max(0, item.bbox.y)}px`;
-    box.style.width = `${Math.max(20, item.bbox.width)}px`;
-    box.style.height = `${Math.max(16, item.bbox.height)}px`;
+    box.className = 'nexus-privacy-mask-box';
+    box.style.position = 'absolute';
+    box.style.left = `${Math.max(0, Math.round(docX))}px`;
+    box.style.top = `${Math.max(0, Math.round(docY))}px`;
+    box.style.width = `${Math.max(20, Math.round(width))}px`;
+    box.style.height = `${Math.max(16, Math.round(height))}px`;
     box.style.backgroundColor = '#05070e';
     box.style.border = item.action === 'BLOCK' ? '2px solid #991b1b' : '2px solid #ef4444';
     box.style.borderRadius = '4px';
@@ -157,16 +386,28 @@ export function renderPagePrivacyMasks(
     label.style.fontWeight = 'bold';
     label.style.letterSpacing = '0.5px';
     label.style.whiteSpace = 'nowrap';
-    label.innerText = `🛡️ [REDACTED: ${item.category.toUpperCase()}]`;
+    const displayCat = item.category.toUpperCase().replace('_', ' ');
+    label.innerText = `🛡️ ${displayCat}`;
 
     box.appendChild(label);
     container.appendChild(box);
+
+    activeTrackedMasks.push({
+      box,
+      targetEl,
+      offsetX,
+      offsetY,
+      width,
+      height,
+      docX,
+      docY,
+    });
   }
 
-  (document.body || document.documentElement).appendChild(container);
+  bodyEl.appendChild(container);
 
-  // Render floating status badge in bottom-right corner
-  badge = document.createElement('div');
+  // Status badge remains fixed in bottom-right corner of viewport
+  const badge = document.createElement('div');
   badge.id = 'nexus-privacy-badge';
   badge.style.position = 'fixed';
   badge.style.bottom = '16px';
@@ -187,7 +428,9 @@ export function renderPagePrivacyMasks(
   badge.style.pointerEvents = 'auto';
   badge.style.cursor = 'default';
   badge.innerHTML = `<span>🛡️</span> <span>Privacy Guard Active: <strong>${masks.length} Field(s) Masked</strong></span>`;
-  (document.body || document.documentElement).appendChild(badge);
+  bodyEl.appendChild(badge);
+
+  attachScrollTracker();
 }
 
 export function clearPagePrivacyMasks() {
@@ -199,29 +442,128 @@ export function clearPagePrivacyMasks() {
   if (badge) {
     badge.remove();
   }
+  // Clear direct element shielding
+  document.querySelectorAll('.nexus-privacy-shielded').forEach((el) => {
+    el.classList.remove('nexus-privacy-shielded');
+  });
+  activeTrackedMasks = [];
 }
 
-let isShieldActive = true;
-let isProactiveAutoScanEnabled = true;
+let isTabSessionActive = false;
+let isShieldActive = false;
+let isMasksExplicitlyHidden = false;
+let mutationObserverInstance: MutationObserver | null = null;
+let inputListenerAttached = false;
+let mutationTimer: any = null;
 
 function isContextValid(): boolean {
   try {
-    return typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id);
+    if (typeof chrome === 'undefined' || !chrome.runtime?.id) {
+      return false;
+    }
+    // Fast check: getManifest throws immediately if extension context has been invalidated
+    return Boolean(chrome.runtime.getManifest());
   } catch {
     return false;
   }
 }
 
-/**
- * Proactively scans the webpage for sensitive PII and applies on-screen redaction masks directly.
- */
-export async function autoScanAndMask() {
-  if (!isContextValid()) {
-    clearPagePrivacyMasks();
+const onInputOrScroll = () => {
+  if (!isContextValid() || !isTabSessionActive || isMasksExplicitlyHidden) {
+    if (!isContextValid()) {
+      deactivateTabSession();
+    }
     return;
   }
-  if (!isShieldActive || !isProactiveAutoScanEnabled) {
+  clearTimeout(mutationTimer);
+  mutationTimer = setTimeout(autoScanAndMask, 250);
+};
+
+export function activateTabSession(session?: any) {
+  if (!isContextValid()) return;
+  if (isTabSessionActive) return;
+  isTabSessionActive = true;
+  isShieldActive = true;
+  console.log('[Nexus Privacy Agent] 🛡️ Agent Session ACTIVE on this tab:', window.location.href);
+
+  injectPrivacyStyles();
+
+  // Attach dynamic mutation observer ONLY on this active tab
+  if (!mutationObserverInstance && document.body) {
+    mutationObserverInstance = new MutationObserver((mutations) => {
+      if (!isContextValid() || !isTabSessionActive || isMasksExplicitlyHidden) {
+        return;
+      }
+      let isOurSelf = false;
+      for (const m of mutations) {
+        if (
+          (m.target as HTMLElement)?.id === 'nexus-page-privacy-container' ||
+          (m.target as HTMLElement)?.id === 'nexus-privacy-badge' ||
+          (m.target as HTMLElement)?.id === 'nexus-agent-execution-overlay'
+        ) {
+          isOurSelf = true;
+          break;
+        }
+      }
+      if (isOurSelf) return;
+
+      clearTimeout(mutationTimer);
+      mutationTimer = setTimeout(autoScanAndMask, 350);
+    });
+
+    try {
+      mutationObserverInstance.observe(document.body, { childList: true, subtree: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!inputListenerAttached) {
+    document.addEventListener('input', onInputOrScroll);
+    window.addEventListener('scroll', onInputOrScroll, { passive: true });
+    window.addEventListener('resize', onInputOrScroll, { passive: true });
+    inputListenerAttached = true;
+  }
+
+  // Immediately run protection scan on this active tab
+  autoScanAndMask();
+}
+
+export function deactivateTabSession() {
+  isTabSessionActive = false;
+  isShieldActive = false;
+  isMasksExplicitlyHidden = false;
+
+  if (mutationObserverInstance) {
+    try {
+      mutationObserverInstance.disconnect();
+    } catch {}
+    mutationObserverInstance = null;
+  }
+
+  if (inputListenerAttached) {
+    try {
+      document.removeEventListener('input', onInputOrScroll);
+      window.removeEventListener('scroll', onInputOrScroll);
+      window.removeEventListener('resize', onInputOrScroll);
+    } catch {}
+    inputListenerAttached = false;
+  }
+
+  clearTimeout(mutationTimer);
+  clearPagePrivacyMasks();
+}
+
+/**
+ * Proactively scans the webpage for sensitive PII and applies on-screen redaction masks directly.
+ * Strictly runs ONLY when an agent session is active on this tab.
+ */
+export async function autoScanAndMask() {
+  if (!isContextValid() || !isTabSessionActive || !isShieldActive || isMasksExplicitlyHidden) {
     clearPagePrivacyMasks();
+    if (!isContextValid()) {
+      deactivateTabSession();
+    }
     return;
   }
 
@@ -237,220 +579,165 @@ export async function autoScanAndMask() {
     }
 
     const policy = await getPolicy();
-    const masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string }> = [];
+    const masks: Array<{ bbox: { x: number; y: number; width: number; height: number }; category: string; action: string; domId?: string }> = [];
 
     for (const c of classifications) {
       const action = resolvePolicyAction(policy, c.category);
       if (action === 'MASK' || action === 'BLOCK' || action === 'ASK') {
+        const domId = c.originalItem?.attributes?.['data-nexus-dom-id'];
         masks.push({
           bbox: c.bbox,
           category: c.category,
           action,
+          domId,
         });
       }
     }
 
-    if (masks.length > 0 && isShieldActive) {
+    if (masks.length > 0 && isTabSessionActive && isShieldActive) {
       renderPagePrivacyMasks(masks);
-      console.log(`[Nexus Privacy Agent] 🛡️ Proactive Auto-Masking applied: ${masks.length} sensitive element(s) shielded from agent vision.`);
+      console.log(`[Nexus Privacy Agent] 🛡️ Shielding active tab: ${masks.length} sensitive element(s) protected.`);
     } else {
       clearPagePrivacyMasks();
     }
   } catch (err: any) {
-    if (!err?.message?.includes('Extension context invalidated')) {
-      console.warn('[Nexus Privacy Agent] autoScanAndMask error:', err);
+    const errMsg = String(err?.message || err || '').toLowerCase();
+    if (errMsg.includes('context invalidated') || errMsg.includes('extension context')) {
+      deactivateTabSession();
     }
   }
 }
 
 export default defineContentScript({
   matches: ['<all_urls>'],
-  main() {
-    console.log('[Nexus Privacy Agent] Proactive Content script initialized on:', window.location.href);
-    try {
-      document.documentElement.dataset.nexusExtensionId = chrome.runtime.id;
-    } catch {
-      // ignore
-    }
-
-    // 0. Sync power and proactive shield state from storage
-    try {
-      if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-        chrome.storage.local.get(['nexus_extension_active', 'nexus_proactive_shield'], (res) => {
-          if (res && res.nexus_extension_active !== undefined) {
-            isShieldActive = Boolean(res.nexus_extension_active);
-          }
-          if (res && res.nexus_proactive_shield !== undefined) {
-            isProactiveAutoScanEnabled = Boolean(res.nexus_proactive_shield);
-          }
-          if (isShieldActive && isProactiveAutoScanEnabled) {
-            setTimeout(autoScanAndMask, 300);
-          } else {
-            clearPagePrivacyMasks();
-          }
-        });
-
-        // Listen for user toggle events across all open browser tabs
-        chrome.storage.onChanged.addListener((changes, area) => {
-          if (area === 'local') {
-            if (changes.nexus_extension_active !== undefined) {
-              isShieldActive = Boolean(changes.nexus_extension_active.newValue);
-              if (!isShieldActive) {
-                clearPagePrivacyMasks();
-                console.log('[Nexus Privacy Agent] 🛑 Privacy Shield paused by user.');
-              } else if (isProactiveAutoScanEnabled) {
-                console.log('[Nexus Privacy Agent] ▶️ Privacy Shield activated by user.');
-                autoScanAndMask();
-              }
-            }
-            if (changes.nexus_proactive_shield !== undefined) {
-              isProactiveAutoScanEnabled = Boolean(changes.nexus_proactive_shield.newValue);
-              if (!isProactiveAutoScanEnabled) {
-                clearPagePrivacyMasks();
-              } else if (isShieldActive) {
-                autoScanAndMask();
-              }
-            }
-          }
-        });
-      }
-    } catch {
-      // fallback
-    }
-
-    // 1. Proactive auto-scan when page loads
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => {
-        if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 300);
+  main(ctx) {
+    // Graceful invalidation cleanup on extension reload/update
+    if (ctx && typeof (ctx as any).onInvalidated === 'function') {
+      (ctx as any).onInvalidated(() => {
+        deactivateTabSession();
       });
-    } else {
-      if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 300);
     }
-    window.addEventListener('load', () => {
-      if (isShieldActive && isProactiveAutoScanEnabled) setTimeout(autoScanAndMask, 500);
-    });
 
-    // 2. Watch for dynamic form inputs or DOM additions (debounced)
-    let mutationTimer: any = null;
-    const observer = new MutationObserver((mutations) => {
-      if (!isContextValid()) {
-        try {
-          observer.disconnect();
-          clearPagePrivacyMasks();
-        } catch {}
-        return;
-      }
-      if (!isShieldActive || !isProactiveAutoScanEnabled) return;
-
-      let isOurSelf = false;
-      for (const m of mutations) {
-        if (
-          (m.target as HTMLElement)?.id === 'nexus-page-privacy-container' ||
-          (m.target as HTMLElement)?.id === 'nexus-privacy-badge'
-        ) {
-          isOurSelf = true;
-          break;
-        }
-      }
-      if (isOurSelf) return;
-
-      clearTimeout(mutationTimer);
-      mutationTimer = setTimeout(autoScanAndMask, 400);
-    });
-
+    // Content script starts completely idle — NO background processing until user starts agent on this tab
     try {
-      if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
+      if (isContextValid()) {
+        document.documentElement.dataset.nexusExtensionId = chrome.runtime.id;
       }
     } catch {
       // ignore
     }
 
-    document.addEventListener('input', () => {
-      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
-      clearTimeout(mutationTimer);
-      mutationTimer = setTimeout(autoScanAndMask, 300);
-    });
-
-    window.addEventListener('scroll', () => {
-      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
-      clearTimeout(mutationTimer);
-      mutationTimer = setTimeout(autoScanAndMask, 80);
-    }, { passive: true });
-
-    window.addEventListener('resize', () => {
-      if (!isContextValid() || !isShieldActive || !isProactiveAutoScanEnabled) return;
-      clearTimeout(mutationTimer);
-      mutationTimer = setTimeout(autoScanAndMask, 100);
-    }, { passive: true });
-
-    // 3. Message handlers for extension popup and background worker
+    // Message handlers for extension popup and background coordinator
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-      if (message && message.type === 'SET_SHIELD_ACTIVE') {
-        isShieldActive = Boolean(message.active);
-        if (!isShieldActive) {
-          clearPagePrivacyMasks();
-        } else if (isProactiveAutoScanEnabled) {
+      if (!message) return;
+
+      if (message.type === 'SESSION_ACTIVATED') {
+        activateTabSession(message.session);
+        sendResponse({ success: true, active: true });
+        return true;
+      }
+
+      if (message.type === 'SESSION_DEACTIVATED' || message.type === 'STOP_AGENT_SESSION') {
+        deactivateTabSession();
+        sendResponse({ success: true, active: false });
+        return true;
+      }
+
+      if (message.type === 'GET_SHIELD_STATUS') {
+        sendResponse({ active: isTabSessionActive, sessionActive: isTabSessionActive });
+        return true;
+      }
+
+      if (message.type === 'SET_SHIELD_ACTIVE') {
+        if (message.active) {
+          activateTabSession();
+        } else {
+          deactivateTabSession();
+        }
+        sendResponse({ success: true, active: isTabSessionActive });
+        return true;
+      }
+
+      if (message.type === 'AUTO_SCAN_PRIVACY') {
+        if (isTabSessionActive) {
+          autoScanAndMask().then(() => sendResponse({ success: true }));
+        } else {
+          sendResponse({ success: false, reason: 'Tab session not active' });
+        }
+        return true;
+      }
+
+      if (message.type === 'GET_CONTEXT') {
+        // Explicit user action on this tab: ensure protection session is active
+        activateTabSession();
+        const dom = extractDom();
+        const viewport = {
+          width: window.innerWidth || document.documentElement.clientWidth,
+          height: window.innerHeight || document.documentElement.clientHeight,
+          dpr: window.devicePixelRatio || 1,
+        };
+        console.log(`[Nexus Privacy Agent] ✅ Extracted ${dom.length} DOM elements from active tab:`, dom);
+        sendResponse({ dom, viewport });
+        return true;
+      }
+
+      if (message.type === 'RENDER_PAGE_MASKS') {
+        isMasksExplicitlyHidden = false;
+        activateTabSession();
+        if (message.masks && message.masks.length > 0) {
+          renderPagePrivacyMasks(message.masks);
+        } else {
           autoScanAndMask();
         }
-        sendResponse({ success: true, active: isShieldActive });
+        sendResponse({ success: true, count: (message.masks || []).length });
         return true;
       }
 
-      if (message && message.type === 'GET_SHIELD_STATUS') {
-        sendResponse({ active: isShieldActive, proactive: isProactiveAutoScanEnabled });
-        return true;
-      }
-
-      if (message && message.type === 'AUTO_SCAN_PRIVACY') {
-        autoScanAndMask().then(() => sendResponse({ success: true }));
-        return true;
-      }
-
-      if (message && message.type === 'GET_CONTEXT') {
-        const dom = extractDom();
-        console.log(`[Nexus Privacy Agent] ✅ Extracted ${dom.length} DOM elements from page:`, dom);
-        sendResponse(dom);
-        return true;
-      }
-
-      if (message && message.type === 'RENDER_PAGE_MASKS') {
-        if (isShieldActive) {
-          renderPagePrivacyMasks(message.masks || []);
-          sendResponse({ success: true, count: (message.masks || []).length });
-        } else {
-          clearPagePrivacyMasks();
-          sendResponse({ success: false, reason: 'Shield paused' });
-        }
-        return true;
-      }
-
-      if (message && message.type === 'CLEAR_PAGE_MASKS') {
+      if (message.type === 'CLEAR_PAGE_MASKS') {
+        isMasksExplicitlyHidden = true;
+        clearTimeout(mutationTimer);
         clearPagePrivacyMasks();
         sendResponse({ success: true });
         return true;
       }
 
-      if (message && message.type === 'EXECUTE_PLAN') {
+      if (message.type === 'EXECUTE_PLAN') {
         const actions: PlanAction[] = message.actions || [];
         const auditLog: AuditLogEntry[] = message.safeContextAuditLog || [];
-        console.log(`[Nexus Privacy Agent] 📥 Received EXECUTE_PLAN with ${actions.length} action(s).`);
+        console.log(`[Nexus Privacy Agent] 📥 Received EXECUTE_PLAN on active tab with ${actions.length} action(s).`);
+
+        // Notify background that execution has begun
+        chrome.runtime.sendMessage({
+          type: 'UPDATE_SESSION_STATUS',
+          status: 'EXECUTING',
+        }).catch(() => {});
 
         executePlan(actions, auditLog)
           .then((report) => {
-            console.log('[Nexus Privacy Agent] 🏁 Execution completed:', report);
+            console.log('[Nexus Privacy Agent] 🏁 Execution completed on tab:', report);
+            // Notify background so session status and executionReport are stored even if popup was hidden/closed!
+            chrome.runtime.sendMessage({
+              type: 'UPDATE_SESSION_STATUS',
+              status: report.success ? 'COMPLETED' : 'ERROR',
+              executionReport: report,
+            }).catch(() => {});
             sendResponse(report);
           })
           .catch((err) => {
             console.error('[Nexus Privacy Agent] ❌ Execution error:', err);
-            sendResponse({
+            const errReport = {
               totalSteps: actions.length,
               executedSteps: 0,
               results: [],
               completedAt: Date.now(),
               success: false,
-              error: err?.message || String(err),
-            });
+            };
+            chrome.runtime.sendMessage({
+              type: 'UPDATE_SESSION_STATUS',
+              status: 'ERROR',
+              executionReport: errReport,
+            }).catch(() => {});
+            sendResponse(errReport);
           });
 
         return true; // Keep message port open for async response

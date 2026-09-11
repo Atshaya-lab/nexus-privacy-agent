@@ -7,8 +7,8 @@ export default defineConfig({
     name: 'Nexus Privacy Agent',
     version: '1.0.0',
     description: 'Privacy-first browser automation agent',
-    permissions: ['activeTab', 'scripting', 'storage', 'debugger'],
-    host_permissions: ['<all_urls>'],
+    permissions: ['tabs', 'activeTab', 'scripting', 'storage', 'debugger', 'unlimitedStorage'],
+    host_permissions: ['<all_urls>', 'http://localhost/*', 'http://127.0.0.1/*'],
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://* http://127.0.0.1:* http://localhost:* data: blob:;",
     },
